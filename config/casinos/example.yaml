@@ -1,0 +1,57 @@
+# Example casino profile — "Live Baccarat 1 NC" reference layout.
+#
+# A casino profile only needs to override what differs from config/default.yaml
+# (it is deep-merged on top). Here we pin the capture region to a 1080p stream
+# and restate the confirmed region map and payout table for clarity.
+
+capture:
+  region:
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+  fps: 2
+  display_id: 0
+
+regions:
+  shoe_counter:    {x: 22,   y: 970,  w: 380, h: 30}
+  big_road:        {x: 22,   y: 1005, w: 620, h: 130}
+  big_eye_boy:     {x: 22,   y: 1140, w: 310, h: 70}
+  small_road:      {x: 22,   y: 1215, w: 310, h: 65}
+  cockroach_pig:   {x: 335,  y: 1140, w: 310, h: 65}
+  table_result:    {x: 800,  y: 700,  w: 400, h: 200}
+  bet_panel:       {x: 740,  y: 985,  w: 845, h: 215}
+
+decks_per_shoe: 8
+penetration_pct: 75
+banker_rule: "ez_baccarat"
+
+payouts:
+  player:                 1.0
+  banker:                 1.0
+  banker_six:             0.5
+  tie:                    8.0
+  super_6:                15.0
+  player_pair:            11.0
+  banker_pair:            11.0
+  either_pair:            5.0
+  suited_pair_one_hand:   25.0
+  suited_pair_both_hands: 200.0
+  p_bonus:
+    natural_win:   1.0
+    natural_tie:   "push"
+    win_by_9:      30.0
+    win_by_8:      10.0
+    win_by_7:      6.0
+    win_by_6:      4.0
+    win_by_5:      2.0
+    win_by_4:      1.0
+  b_bonus:
+    natural_win:   1.0
+    natural_tie:   "push"
+    win_by_9:      30.0
+    win_by_8:      10.0
+    win_by_7:      6.0
+    win_by_6:      4.0
+    win_by_5:      2.0
+    win_by_4:      1.0

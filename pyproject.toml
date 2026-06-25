@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "baccarat-vision"
+version = "0.1.0"
+description = "Read-only live-vision baccarat analyzer: shoe composition tracking, honest probabilities, and a bet-spread payout calculator."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Core runtime. PySide6 ships wheels for CPython 3.9-3.13; use one of those for
+# the GUI (the engine + tests run on any 3.11+). opencv/mss/SQLAlchemy power the
+# vision, capture and persistence layers (steps 4-8) and are imported lazily, so
+# manual mode still works if a wheel is missing on an exotic platform.
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "PySide6>=6.6",
+    # Headless build: it does NOT bundle Qt, so it can't clobber PySide6's
+    # platform plugins. (Plain opencv-python ships its own Qt and crashes the
+    # GUI at QApplication init. EasyOCR also depends on the headless build, so
+    # this keeps a single, conflict-free OpenCV in the environment.)
+    "opencv-python-headless>=4.9",
+    "mss>=9.0",
+    "SQLAlchemy>=2.0",
+    # macOS screen capture at native Retina resolution (mss only gives half-res
+    # logical pixels, which is too low for OCR). Falls back to mss off-macOS.
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# OCR engines — EasyOCR is preferred on Apple Silicon (GPU); pytesseract is the
+# lighter fallback. Heavy (torch), so kept optional; the app degrades to manual
+# entry + a NullBackend without them.
+ocr = [
+    "easyocr>=1.7",
+    "pytesseract>=0.3.10",
+]
+# macOS Screen Recording permission preflight + Quartz capture fallback.
+macos = [
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+baccarat-vision = "baccarat_vision.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/baccarat_vision"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

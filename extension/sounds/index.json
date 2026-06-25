@@ -1,0 +1,21 @@
+{
+  "win": [
+    "sounds/win/floraphonic-playful-casino-slot-machine-jackpot-3-183921.mp3",
+    "sounds/win/floraphonic-violin-win-5-185128.mp3",
+    "sounds/win/floraphonic-you-win-sequence-2-183949.mp3",
+    "sounds/win/freesound_community-aw-yeah-awww-yeah-aww-yeah-2-95782.mp3",
+    "sounds/win/freesound_community-winner-bell-game-show-91932.mp3",
+    "sounds/win/jesuschristisgod-children-saying-yay-praise-and-worship-jesus-299607.mp3",
+    "sounds/win/mrstokes302-you-win-sfx-mrstokes302-442128.mp3",
+    "sounds/win/u_it78ck90s3-orchestral-win-331233.mp3",
+    "sounds/win/u_ss015dykrt-brass-fanfare-with-timpani-and-winchimes-reverberated-146260.mp3"
+  ],
+  "lose": [
+    "sounds/lose/adhimahadi-aww-8277.mp3",
+    "sounds/lose/adhimahadi-ba-dum-tss-8279.mp3",
+    "sounds/lose/drummusiclooper5000-lose-sfx-365579.mp3",
+    "sounds/lose/mrstokes302-you-lose-sfx-mrstokes302-528744.mp3",
+    "sounds/lose/u_l5xum8z250-losing-horn-313723.mp3",
+    "sounds/lose/universfield-cartoon-fail-trumpet-278822.mp3"
+  ]
+}

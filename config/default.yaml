@@ -1,0 +1,89 @@
+capture:
+  region:
+    x: 0
+    y: 0
+    width: 3456
+    height: 2234
+  fps: 2
+  display_id: 0
+regions:
+  shoe_counter:
+    x: 377
+    y: 1562
+    w: 332
+    h: 73
+  table_result:
+    x: 1414
+    y: 933
+    w: 719
+    h: 363
+  card_player:
+    x: 1358
+    y: 1569
+    w: 432
+    h: 321
+  card_banker:
+    x: 1787
+    y: 1576
+    w: 408
+    h: 321
+decks_per_shoe: 8
+penetration_pct: 75.0
+banker_rule: ez_baccarat
+payouts:
+  player: 1.0
+  banker: 1.0
+  banker_six: 0.5
+  tie: 8.0
+  super_6: 15.0
+  player_pair: 11.0
+  banker_pair: 11.0
+  either_pair: 5.0
+  suited_pair_one_hand: 25.0
+  suited_pair_both_hands: 200.0
+  p_bonus:
+    natural_win: 1.0
+    natural_tie: push
+    win_by_9: 30.0
+    win_by_8: 10.0
+    win_by_7: 6.0
+    win_by_6: 4.0
+    win_by_5: 2.0
+    win_by_4: 1.0
+    win_by_1_to_3: lose
+    loss: lose
+  b_bonus:
+    natural_win: 1.0
+    natural_tie: push
+    win_by_9: 30.0
+    win_by_8: 10.0
+    win_by_7: 6.0
+    win_by_6: 4.0
+    win_by_5: 2.0
+    win_by_4: 1.0
+max_bets:
+  player: 5000.0
+  banker: 5000.0
+  super_6: 5000.0
+  tie: 1000.0
+  player_pair: 500.0
+  banker_pair: 500.0
+  either_pair: 1000.0
+  suited_pair: 50.0
+  p_bonus: 200.0
+  b_bonus: 200.0
+min_bet: 1.0
+ui:
+  always_on_top: true
+  opacity: 0.95
+  theme: dark
+prediction:
+  min_hands_before_predicting: 10
+  composition_weight: 1.0
+  road_weight: 0.0
+  confidence_floor: 0.0
+  confidence_ceiling: 1.0
+vision:
+  ocr_backend: auto
+  read_cards: true
+  burn_cards: 10

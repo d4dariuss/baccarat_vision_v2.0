@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Baccarat Vision",
+  "version": "0.1.0",
+  "description": "Reads live baccarat game state from the page DOM and shows honest, composition-based predictions. Read-only analysis.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://*.petros04.com/*",
+    "https://*.spinquest.com/*",
+    "http://127.0.0.1:8777/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://*.petros04.com/*", "https://*.spinquest.com/*"],
+      "all_frames": true,
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sounds/win/*.mp3", "sounds/lose/*.mp3", "sounds/index.json"],
+      "matches": ["https://*.petros04.com/*", "https://*.spinquest.com/*"]
+    }
+  ]
+}

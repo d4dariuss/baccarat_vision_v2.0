@@ -1,0 +1,10 @@
+/* Baccarat Vision overlay — base reset only.
+   All panel styling is injected at runtime by injectCSS() in content.js
+   so it can use dynamic colours. This file must NOT set pointer-events:none
+   on #bv-panel — the panel needs to receive clicks and drag events. */
+
+#bv-panel {
+  /* Ensure the panel sits above everything on the host page. */
+  z-index: 2147483647 !important;
+  pointer-events: auto !important;
+}
