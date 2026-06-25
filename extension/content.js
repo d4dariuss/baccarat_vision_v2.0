@@ -231,6 +231,9 @@
   let lastSnapshot = null;
   let dumpedScoreboard = false;
   let prevBalance = null; // balance snapshot used to detect bet win/loss
+  // Last non-null counter snapshot — captured synchronously in the MutationObserver
+  // callback so the 250 ms debounce can't drop it before tick() runs.
+  let _savedCounter = null;
 
   // ─── Session followed-picks P/L ────────────────────────────────────────────
   const session = {
@@ -249,7 +252,12 @@
 
   let sawGame = false;
   async function tick() {
-    const c = readCounter();
+    const liveC = readCounter();
+    // Keep _savedCounter in sync so the observer value never lags a full interval.
+    if (liveC) _savedCounter = liveC;
+    // Fall back to the observer-captured snapshot when the Burn Card Procedure
+    // screen hides the counter — prevents the last hand being silently dropped.
+    const c = liveC ?? _savedCounter;
     const isGame = !!c || !!document.querySelector('[class*="scoreBoardInfo"],[class*="baccaratCardsStack"]');
     if (isGame) sawGame = true;
     if (!sawGame) return;  // overlay + pipeline run only in the game frame
@@ -414,17 +422,38 @@
                     : Math.abs(n) >= 1e3 ? (n / 1e3).toFixed(0) + "K"
                     : Math.round(n).toString();
 
+  // ─── Icon set (Lucide-style SVG, self-contained — no external CDN needed) ──
+  const _ICONS = {
+    target:          '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+    coins:           '<circle cx="8" cy="8" r="6"/><path d="M14.5 9A6 6 0 1 1 9 14.5"/><line x1="8" y1="5.5" x2="8" y2="10.5"/>',
+    "bar-chart":     '<rect x="3" y="12" width="4" height="8"/><rect x="10" y="8" width="4" height="12"/><rect x="17" y="4" width="4" height="16"/>',
+    cpu:             '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M20 9h2M2 15h2M20 15h2"/>',
+    wallet:          '<path d="M20 12V8H6a2 2 0 0 1 0-4h14v4"/><path d="M4 6v12a2 2 0 0 0 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/>',
+    "trending-up":   '<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+    layers:          '<polygon points="12 2 2 7 12 12 22 7"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+    list:            '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+    lock:            '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    check:           '<polyline points="20 6 9 17 4 12"/>',
+    "alert-triangle":'<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    "refresh-cw":    '<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>',
+    diamond:         '<path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.41l7.59 7.59a2.41 2.41 0 0 0 3.41 0l7.59-7.59a2.41 2.41 0 0 0 0-3.41l-7.59-7.59a2.41 2.41 0 0 0-3.41 0Z"/>',
+  };
+  function icon(name, sz = 14, col = "currentColor") {
+    const p = _ICONS[name] || "";
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="${col}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;flex-shrink:0">${p}</svg>`;
+  }
+
   const BET_COLOR = {
     banker: "#ff3d71", player: "#00b4ff", tie: "#00ff94",
     super_6: "#c97bff", b_bonus: "#ff9f00", p_bonus: "#ff9f00",
     either_pair: "#ffd700", player_pair: "#ff69b4", banker_pair: "#ff69b4",
     suited_pair: "#ff69b4",
   };
-  const BET_ICON = {
-    banker: "🔴", player: "🔵", tie: "🟢", super_6: "🟣",
-    b_bonus: "🟠", p_bonus: "🟠", either_pair: "🟡",
-    player_pair: "🩷", banker_pair: "🩷", suited_pair: "💎",
-  };
+  // Colored dot representing a bet type — uses BET_COLOR so defined after it.
+  function betDot(bet) {
+    const c = BET_COLOR[bet] || "#b0b8d8";
+    return `<svg width="7" height="7" viewBox="0 0 8 8" style="display:inline-block;vertical-align:middle;flex-shrink:0;margin-right:3px"><circle cx="4" cy="4" r="4" fill="${c}"/></svg>`;
+  }
   const BET_NAMES = {
     player: "Player", banker: "Banker", super_6: "Super 6", tie: "Tie",
     player_pair: "P Pair", banker_pair: "B Pair", either_pair: "Either Pair",
@@ -458,14 +487,14 @@
   // ─── Section factory ───────────────────────────────────────────────────────
   // Sections survive panel recreation — store open/closed state by id.
   const _sectionState = {};
-  function makeSection(id, icon, title, defaultOpen = true) {
+  function makeSection(id, iconName, title, defaultOpen = true) {
     const open = _sectionState[id] !== undefined ? _sectionState[id] : defaultOpen;
     const sec = document.createElement("div");
-    // border-top and background come from .bvsh CSS class — no inline styles needed
     sec.innerHTML =
       `<div class="bvsh" data-id="${id}">` +
-      `<span style="font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:#5a6080">` +
-      `${icon} ${title}</span>` +
+      `<span style="display:inline-flex;align-items:center;gap:5px;font-family:'Cinzel','Palatino Linotype',serif;` +
+      `font-size:9.5px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#5a6080">` +
+      `${icon(iconName, 11, "#5a6080")}${title}</span>` +
       `<span class="bvchev" style="color:#3a3a60;font-size:9px">${open ? "▼" : "▶"}</span></div>` +
       `<div class="bvsb" id="bvsb-${id}" style="display:${open ? "block" : "none"}"></div>`;
     sec.querySelector(".bvsh").addEventListener("click", () => {
@@ -486,7 +515,9 @@
     if (document.getElementById("bv-css")) return;
     const s = document.createElement("style");
     s.id = "bv-css";
-    s.textContent = `
+    // @import must be the first rule in the stylesheet.
+    s.textContent = `@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&display=swap');
+
       #bv-panel{position:fixed;top:12px;right:12px;width:284px;max-height:calc(100vh - 24px);
         overflow-y:auto;overflow-x:hidden;background:#07071a;
         border:1px solid #00e5ff22;border-radius:14px;
@@ -497,21 +528,32 @@
       #bv-panel::-webkit-scrollbar{width:3px}
       #bv-panel::-webkit-scrollbar-track{background:#07071a}
       #bv-panel::-webkit-scrollbar-thumb{background:#1e1e40;border-radius:2px}
-      #bv-hdr{display:flex;align-items:center;justify-content:space-between;
-        padding:10px 12px;background:#05051a;border-radius:14px 14px 0 0;
-        border-bottom:1px solid #0f0f28;cursor:grab;position:sticky;top:0;z-index:1}
+      #bv-hdr{position:sticky;top:0;z-index:1;padding:11px 14px 9px;
+        background:#05051a;border-radius:14px 14px 0 0;
+        border-bottom:1px solid #0f0f28;cursor:grab;text-align:center}
       #bv-hdr:active{cursor:grabbing}
+      .bv-logo{font-family:'Cinzel','Palatino Linotype','Palatino',serif;
+        font-weight:700;font-size:13px;letter-spacing:3px;
+        color:#00e5ff;text-shadow:0 0 14px #00e5ff50;line-height:1.2;
+        white-space:nowrap}
+      #bv-status{font-size:9px;color:#3a3a60;letter-spacing:.3px;margin-top:2px;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #bv-min{position:absolute;right:10px;top:50%;transform:translateY(-50%);
+        background:none;border:none;color:#3a3a60;cursor:pointer;
+        font-size:15px;line-height:1;padding:4px;flex-shrink:0}
+      #bv-min:hover{color:#5a5a80}
 
       /* Orb — uses filter:drop-shadow so the circular glow is never square-clipped
          by overflow:hidden on ancestors. box-shadow would be clipped; this is not. */
       .bv-orb{width:62px;height:62px;border-radius:50%;
         display:flex;align-items:center;justify-content:center;
-        font-size:24px;font-weight:900;flex-shrink:0;
+        font-family:'Cinzel','Palatino Linotype',serif;
+        font-size:22px;font-weight:700;flex-shrink:0;
         transition:filter .5s,background .5s,border-color .5s}
 
-      /* Section headers (via CSS class — no inline styles needed) */
+      /* Section headers */
       .bvsh{display:flex;align-items:center;justify-content:space-between;
-        padding:8px 12px;cursor:pointer;background:#09091f;user-select:none;
+        padding:7px 12px;cursor:pointer;background:#09091f;user-select:none;
         border-top:1px solid #0f0f28}
       .bvsh:hover{background:#0c0c24}
       .bvsb{padding:10px 12px}
@@ -529,7 +571,7 @@
         padding:4px 0;border-bottom:1px solid #0d0d22;min-width:0}
       .bv-leg-row:last-child{border-bottom:none}
       .bv-leg-name{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;
-        text-overflow:ellipsis;flex:1;min-width:0}
+        text-overflow:ellipsis;flex:1;min-width:0;display:flex;align-items:center}
       .bv-leg-meta{font-size:10px;color:#5a6080;white-space:nowrap;
         margin-left:5px;flex-shrink:0}
       .bv-bet-tbl{width:100%;border-collapse:collapse;font-size:10px}
@@ -538,7 +580,9 @@
       .bv-bet-tbl tr:nth-child(even) td{background:#0a0a20}
       .bv-reason{font-size:10px;color:#5a6080;padding:2px 0;
         overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .bv-badge{display:inline-flex;align-items:center;font-size:9px;font-weight:800;
+      .bv-badge{display:inline-flex;align-items:center;gap:4px;
+        font-family:'Cinzel','Palatino Linotype',serif;
+        font-size:9px;font-weight:700;
         padding:3px 9px;border-radius:5px;letter-spacing:.9px}
       .bv-badge-bet{background:#00e5ff14;color:#00e5ff;border:1px solid #00e5ff44;
         text-shadow:0 0 8px #00e5ff80}
@@ -560,13 +604,9 @@
     const hdr = document.createElement("div");
     hdr.id = "bv-hdr";
     hdr.innerHTML =
-      `<div style="display:flex;align-items:center;gap:6px;min-width:0">` +
-      `<span style="color:#00e5ff;font-weight:800;font-size:11px;letter-spacing:1.5px;` +
-      `text-shadow:0 0 10px #00e5ff;white-space:nowrap">🎯 BV</span>` +
-      `<span id="bv-status" style="color:#3a3a60;font-size:10px;overflow:hidden;` +
-      `text-overflow:ellipsis;white-space:nowrap">starting…</span></div>` +
-      `<button id="bv-min" title="Minimise" style="background:none;border:none;` +
-      `color:#3a3a60;cursor:pointer;font-size:13px;padding:0 0 0 6px;flex-shrink:0">_</button>`;
+      `<div class="bv-logo">BACCARAT VISION</div>` +
+      `<div id="bv-status">starting…</div>` +
+      `<button id="bv-min" title="Minimise">&#x2013;</button>`;
     panel.appendChild(hdr);
     statusEl = panel.querySelector("#bv-status");
 
@@ -578,7 +618,7 @@
       e.stopPropagation();
       _minimised = !_minimised;
       body.style.display = _minimised ? "none" : "block";
-      panel.querySelector("#bv-min").textContent = _minimised ? "□" : "_";
+      panel.querySelector("#bv-min").innerHTML = _minimised ? "&#x25A1;" : "&#x2013;";
     });
 
     // ── Dragging ──
@@ -600,14 +640,14 @@
     document.addEventListener("mouseup", () => { dragging = false; });
 
     // ── Sections (in body div) ──
-    const secPick    = makeSection("pick",    "🎯", "Next Pick",    true);
-    const secSpread  = makeSection("spread",  "💰", "Bet Spread",   true);
-    const secPattern = makeSection("pattern", "📊", "Pattern",      true);
-    const secModel   = makeSection("model",   "🧠", "AI Engine",    true);
-    const secBalance = makeSection("balance", "🏦", "Balance",      true);
-    const secSession = makeSection("session", "📈", "Session",      true);
-    const secHand    = makeSection("hand",    "🃏", "Last Hand",    false);
-    const secBets    = makeSection("bets",    "📋", "All Bets",     false);
+    const secPick    = makeSection("pick",    "target",      "Next Pick",  true);
+    const secSpread  = makeSection("spread",  "coins",       "Bet Spread", true);
+    const secPattern = makeSection("pattern", "bar-chart",   "Pattern",    true);
+    const secModel   = makeSection("model",   "cpu",         "AI Engine",  true);
+    const secBalance = makeSection("balance", "wallet",      "Balance",    true);
+    const secSession = makeSection("session", "trending-up", "Session",    true);
+    const secHand    = makeSection("hand",    "layers",      "Last Hand",  false);
+    const secBets    = makeSection("bets",    "list",        "All Bets",   false);
     [secPick, secSpread, secPattern, secModel, secBalance, secSession, secHand, secBets]
       .forEach((s) => body.appendChild(s));
 
@@ -676,7 +716,7 @@
 
     if (!data) {
       const el = $("pick");
-      if (el) el.innerHTML = `<div style="color:#ff9f00;font-size:11px">⚠ Engine offline — run the server</div>`;
+      if (el) el.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f00;font-size:11px">${icon("alert-triangle",13,"#ff9f00")} Engine offline — run the server</div>`;
       return;
     }
 
@@ -688,7 +728,7 @@
     const pat = data.pattern;
     const cur = (st && st.currency) || (bk && bk.currency) || "";
 
-    // ── 🎯 Next Pick ─────────────────────────────────────────────────────── //
+    // ── Next Pick ────────────────────────────────────────────────────────── //
     const pickEl = $("pick");
     if (pickEl && m && m.pick) {
       const col = m.confident ? (BET_COLOR[m.pick] || "#b0b8d8") : "#4a5070";
@@ -696,7 +736,7 @@
       const letter = m.pick === "banker" ? "B" : m.pick === "player" ? "P"
                    : m.pick === "tie"    ? "T" : m.pick[0].toUpperCase();
       const badge = m.confident
-        ? `<span class="bv-badge bv-badge-bet">✦ BET</span>`
+        ? `<span class="bv-badge bv-badge-bet">${icon("diamond",9,"#00e5ff")} BET</span>`
         : `<span class="bv-badge bv-badge-opt">WAIT</span>`;
       const stakeStr = st ? `${fmtK(st.stake)}${cur ? " " + cur : ""}` : "—";
       const vibe = m.vibe || 0;
@@ -704,14 +744,14 @@
       let unlockHtml = "";
       if (L) {
         if (m.confident) {
-          const proven = L.significant ? "✓ proven edge" : "✓ net +edge";
-          unlockHtml = `<div class="bv-reason" style="color:#00ff94;margin-top:5px">${proven} · ${L.acts} hands graded</div>`;
+          const proven = L.significant ? "proven edge" : "net +edge";
+          unlockHtml = `<div class="bv-reason" style="display:flex;align-items:center;gap:4px;color:#00ff94;margin-top:5px">${icon("check",10,"#00ff94")} ${proven} · ${L.acts} hands graded</div>`;
         } else {
           const have = L.acts || 0, need = L.min_hands || 15;
           const pph = (L.profit_per_hand || 0) * 100;
           const why = have < need ? `${have}/${need} hands`
             : pph <= 0 ? `P/H ${pph.toFixed(1)}` : "building confidence";
-          unlockHtml = `<div class="bv-reason" style="margin-top:5px">🔒 BET unlocks: ${why}</div>`;
+          unlockHtml = `<div class="bv-reason" style="display:flex;align-items:center;gap:4px;margin-top:5px">${icon("lock",10,"#5a6080")} BET unlocks: ${why}</div>`;
         }
       }
 
@@ -725,9 +765,9 @@
         `<div class="bv-orb" style="background:${col}16;border:2px solid ${col}50;` +
         `filter:drop-shadow(0 0 14px ${col});color:${col}">${letter}</div>` +
         `<div style="flex:1;min-width:0">` +
-        `<div style="font-size:19px;font-weight:800;color:${col};letter-spacing:.5px;` +
-        `line-height:1.1;margin-bottom:6px;white-space:nowrap;overflow:hidden;` +
-        `text-overflow:ellipsis">${m.pick_label.toUpperCase()}</div>` +
+        `<div style="font-family:'Cinzel','Palatino Linotype',serif;font-size:19px;font-weight:700;` +
+        `color:${col};letter-spacing:.5px;line-height:1.1;margin-bottom:6px;white-space:nowrap;` +
+        `overflow:hidden;text-overflow:ellipsis">${m.pick_label.toUpperCase()}</div>` +
         `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">` +
         badge +
         `<span style="font-size:12px;font-weight:700;color:#00e5ff">${stakeStr}</span>` +
@@ -739,7 +779,7 @@
         unlockHtml + reasons;
     }
 
-    // ── 💰 Bet Spread ────────────────────────────────────────────────────── //
+    // ── Bet Spread ───────────────────────────────────────────────────────── //
     const spreadEl = $("spread");
     if (spreadEl) {
       let html = "";
@@ -778,7 +818,7 @@
           const evTxt = `EV ${leg.ev >= 0 ? "+" : ""}${fmtK(leg.ev)}`;
           html +=
             `<div class="bv-leg-row">` +
-            `<span class="bv-leg-name" style="color:${lc}">${BET_ICON[leg.bet] || ""} ${leg.label}</span>` +
+            `<span class="bv-leg-name" style="color:${lc}">${betDot(leg.bet)}${leg.label}</span>` +
             `<span class="bv-leg-meta">${fmtK(leg.stake)}${cur ? " " + cur : ""}</span>` +
             `<span class="bv-leg-meta" style="color:${evCol};margin-left:4px">${evTxt}</span>` +
             `</div>`;
@@ -811,7 +851,7 @@
             ` <span style="color:#4a5070;font-size:9px">(${ratio >= 1 ? "+" : ""}${((ratio - 1) * 100).toFixed(0)}% vs base)</span></span></div>`;
         }
         if (!ds.affordable) {
-          html += `<div style="color:#ff9f00;font-size:10px;margin-top:3px">⚠ scaled to fit balance</div>`;
+          html += `<div style="display:flex;align-items:center;gap:4px;color:#ff9f00;font-size:10px;margin-top:3px">${icon("alert-triangle",11,"#ff9f00")} scaled to fit balance</div>`;
         }
       }
 
@@ -829,7 +869,7 @@
 
       // Preset layout (always shown as reference)
       if (st && st.spread_legs && st.spread_legs.length) {
-        const warn = st.spread_affordable ? "" : ` <span style="color:#ff9f00">⚠ over balance</span>`;
+        const warn = st.spread_affordable ? "" : ` <span style="display:inline-flex;align-items:center;gap:3px;color:#ff9f00">${icon("alert-triangle",11,"#ff9f00")} over balance</span>`;
         html += `<div style="margin-top:6px;border-top:1px solid #12122e;padding-top:5px">` +
           `<div style="font-size:10px;color:#4a5070;text-transform:uppercase;` +
           `letter-spacing:.5px;margin-bottom:4px">Preset · ${fmtK(st.spread_total)} ${cur}${warn}</div>` +
@@ -845,12 +885,12 @@
       spreadEl.innerHTML = html;
     }
 
-    // ── 📊 Pattern ───────────────────────────────────────────────────────── //
+    // ── Pattern ──────────────────────────────────────────────────────────── //
     const patEl = $("pattern");
     if (patEl && pat) {
       const since = pat.hands_since || {};
       const streakTxt = pat.streak_len > 1
-        ? `${pat.streak_len}× ${pat.streak_side}${pat.is_dragon ? " 🐉" : ""}`
+        ? `${pat.streak_len}× ${pat.streak_side}${pat.is_dragon ? ` <span style="font-size:9px;font-weight:800;color:#ff3d71;letter-spacing:.5px">DRAGON</span>` : ""}`
         : "none";
       const chopPct = (pat.chop_score * 100).toFixed(0);
       const chopCol = pat.chop_score > 0.6 ? "#00ff94" : pat.chop_score > 0.35 ? "#ffd700" : "#ff6b6b";
@@ -876,7 +916,7 @@
         renderTemplateMatch(data.template_match);
     }
 
-    // ── 🧠 AI Engine ─────────────────────────────────────────────────────── //
+    // ── AI Engine ────────────────────────────────────────────────────────── //
     const modelEl = $("model");
     if (modelEl) {
       if (L && L.graded > 0) {
@@ -907,11 +947,11 @@
           renderVoteSummary(data.vote_summary) +
           renderCalibration(data.calibration);
       } else {
-        modelEl.innerHTML = `<div style="color:#4a5070;font-size:11px">🔄 Collecting data — grading every hand…</div>`;
+        modelEl.innerHTML = `<div style="display:flex;align-items:center;gap:6px;color:#4a5070;font-size:11px">${icon("refresh-cw",13,"#4a5070")} Collecting data — grading every hand…</div>`;
       }
     }
 
-    // ── 🏦 Balance ───────────────────────────────────────────────────────── //
+    // ── Balance ──────────────────────────────────────────────────────────── //
     const balEl = $("balance");
     if (balEl) {
       if (bk && bk.currency && bk.balance) {
@@ -931,11 +971,11 @@
               `<span class="bv-val">${pnlFmt(bk.suggested_pnl)} ${bk.currency}</span></div>`
             : "");
       } else {
-        balEl.innerHTML = `<div style="color:#ff9f00;font-size:11px">⚠ Balance not detected — open the table first</div>`;
+        balEl.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f00;font-size:11px">${icon("alert-triangle",13,"#ff9f00")} Balance not detected — open the table first</div>`;
       }
     }
 
-    // ── 📈 Session ───────────────────────────────────────────────────────── //
+    // ── Session ──────────────────────────────────────────────────────────── //
     const sessEl = $("session");
     if (sessEl) {
       const followed = session.followedHands;
@@ -972,7 +1012,7 @@
       handEl.innerHTML = `<div style="color:#4a5070;font-size:10px">Waiting for next hand…</div>`;
     }
 
-    // ── 📋 All Bets ──────────────────────────────────────────────────────── //
+    // ── All Bets ─────────────────────────────────────────────────────────── //
     const betsEl = $("bets");
     if (betsEl && L && L.bets) {
       const richHands = (data.vision && data.vision.length) ? data.vision[0].n : 0;
@@ -984,7 +1024,7 @@
         `<td style="color:#4a5070">Bet</td><td style="color:#4a5070">Hit%</td>` +
         `<td style="color:#4a5070">Hands</td><td style="color:#4a5070">/100</td></tr></thead><tbody>` +
         L.bets.map((r) => {
-          const star = r.significant ? " ✓" : "";
+          const star = r.significant ? `<span style="display:inline-flex;vertical-align:middle;margin-left:3px">${icon("check",9,"#00ff94")}</span>` : "";
           const pc = (r.hit * 100).toFixed(0);
           const pcol = r.significant ? "#00ff94" : r.per100 > 0 ? "#ffd700" : "#b0b8d8";
           return `<tr><td style="color:${BET_COLOR[r.bet] || "#b0b8d8"}">${BET_NAMES[r.bet] || r.bet}${star}</td>` +
@@ -1000,6 +1040,10 @@
   setInterval(relayBalance, 1500);
   let pending = null;
   const observer = new MutationObserver(() => {
+    // Read counter synchronously here so the 250 ms debounce below can't race
+    // against a subsequent "Burn Card Procedure" DOM update that hides the counter.
+    const _oc = readCounter();
+    if (_oc) _savedCounter = _oc;
     if (pending) return;
     pending = setTimeout(() => { pending = null; tick(); }, 250);
   });

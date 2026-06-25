@@ -144,6 +144,13 @@ class AppController:
             # How fast the ensemble re-weights toward a new regime (Fixed-Share).
             self.learner.set_share(float(responsiveness))
         if currency is not None:
+            if currency != bk["currency"]:
+                # Currency switched (e.g. GC → SC): all balance-denominated state
+                # is stale — reset so the first arriving balance seeds everything
+                # fresh in the new currency.
+                bk["shoe_start_balance"] = None
+                bk["suggested_pnl"] = 0.0
+                bk["consec_losses"] = 0
             bk["currency"] = currency
         if balance is not None:
             bk["balance"] = float(balance)
