@@ -471,7 +471,7 @@
   function bar(pct, color, h = 3) {
     const w = Math.max(0, Math.min(100, pct * 100)).toFixed(1);
     return `<div style="height:${h}px;background:#1a1a35;border-radius:2px;overflow:hidden;margin:2px 0">` +
-           `<div style="width:${w}%;height:100%;background:${color};border-radius:2px;` +
+           `<div class="bv-bar-fill" style="width:${w}%;height:100%;background:${color};border-radius:2px;` +
            `box-shadow:0 0 6px ${color}80;transition:width .3s"></div></div>`;
   }
 
@@ -482,6 +482,76 @@
     return `<span style="display:inline-block;background:#12122e;border:1px solid #2a2a55;border-radius:3px;` +
            `padding:1px 5px;margin:0 1px;font-size:11px;font-family:monospace;color:${col}">` +
            `${c.rank}${SUIT_DISP[c.suit] || ""}</span>`;
+  }
+
+  // ─── Animation helpers ─────────────────────────────────────────────────────
+
+  function pingOrb(wrapEl) {
+    if (!wrapEl) return;
+    const orbEl = wrapEl.querySelector(".bv-orb");
+    for (let i = 0; i < 2; i++) {
+      setTimeout(() => {
+        const r = document.createElement("div");
+        r.className = "bv-ring";
+        r.style.color = orbEl ? orbEl.style.color : "#00e5ff";
+        wrapEl.appendChild(r);
+        setTimeout(() => r.remove(), 960);
+      }, i * 230);
+    }
+  }
+
+  function edgeFlash(type) {
+    if (!panel) return;
+    panel.classList.remove("bv-flash-win", "bv-flash-lose");
+    void panel.offsetWidth;
+    panel.classList.add(type === "win" ? "bv-flash-win" : "bv-flash-lose");
+    setTimeout(() => panel && panel.classList.remove("bv-flash-win", "bv-flash-lose"), 850);
+  }
+
+  function scanNewShoe() {
+    if (!panel) return;
+    const hdr = panel.querySelector("#bv-hdr");
+    if (!hdr) return;
+    const sw = document.createElement("div");
+    sw.className = "bv-scan-wipe";
+    hdr.appendChild(sw);
+    setTimeout(() => sw.remove(), 700);
+  }
+
+  function floatDelta(text, color, anchorEl) {
+    if (!anchorEl) return;
+    const r = anchorEl.getBoundingClientRect();
+    const el = document.createElement("div");
+    el.className = "bv-float-delta";
+    el.textContent = text;
+    el.style.color = color;
+    el.style.left = Math.round(r.left + r.width / 2 - 28) + "px";
+    el.style.top  = Math.round(r.top - 4) + "px";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 1200);
+  }
+
+  function sweepSection(id) {
+    if (!panel) return;
+    const hdr = panel.querySelector(`[data-id="${id}"]`);
+    if (!hdr) return;
+    const sw = document.createElement("div");
+    sw.className = "bv-sweep";
+    hdr.style.position = "relative";
+    hdr.style.overflow = "hidden";
+    hdr.appendChild(sw);
+    setTimeout(() => { sw.remove(); hdr.style.overflow = ""; }, 650);
+  }
+
+  function arcSvg(pct) {
+    const R = 30, C = +(2 * Math.PI * R).toFixed(1);
+    const off = +(C * (1 - Math.max(0, Math.min(1, pct)))).toFixed(1);
+    return `<svg width="68" height="68" viewBox="0 0 68 68"` +
+      ` style="position:absolute;top:-3px;left:-3px;pointer-events:none;transform:rotate(-90deg)">` +
+      `<circle cx="34" cy="34" r="${R}" fill="none" stroke="#00e5ff14" stroke-width="2.5"/>` +
+      `<circle cx="34" cy="34" r="${R}" fill="none" stroke="#00e5ff" stroke-width="2.5"` +
+      ` stroke-dasharray="${C}" stroke-dashoffset="${off}" stroke-linecap="round"` +
+      ` style="transition:stroke-dashoffset .4s ease"/></svg>`;
   }
 
   // ─── Section factory ───────────────────────────────────────────────────────
@@ -503,6 +573,10 @@
       const nowOpen = body.style.display !== "none";
       body.style.display = nowOpen ? "none" : "block";
       chev.textContent = nowOpen ? "▶" : "▼";
+      chev.classList.remove("bv-chev-open", "bv-chev-close");
+      void chev.offsetWidth;
+      chev.classList.add(nowOpen ? "bv-chev-close" : "bv-chev-open");
+      setTimeout(() => chev.classList.remove("bv-chev-open", "bv-chev-close"), 380);
       _sectionState[id] = !nowOpen;
     });
     return sec;
@@ -510,6 +584,14 @@
 
   // ─── Panel + dragging ──────────────────────────────────────────────────────
   let panel = null, statusEl = null, _minimised = false;
+
+  // ── Animation state ────────────────────────────────────────────────────────
+  let _prevConfident   = false;  // BET on/off — drives burst + title widen
+  let _prevBalanceAnim = null;   // last rendered balance — drives delta float
+  let _prevDragon      = false;  // dragon onset — drives shake
+  let _prevHandNum     = 0;      // detects new shoe for scan wipe
+  let _sectionInited   = {};     // tracks first-data sweep per section
+  let _handHistory     = [];     // last 14 P/B/T outcomes for bead row
 
   function injectCSS() {
     if (document.getElementById("bv-css")) return;
@@ -590,6 +672,106 @@
       .bv-phase{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;
         border-radius:10px;letter-spacing:.5px}
       .bv-divider{border:none;border-top:1px solid #0f0f28;margin:8px 0}
+
+      /* ── Animations ─────────────────────────────────────────────────────── */
+
+      /* Radar ring pings outward from orb */
+      @keyframes bv-ring-out{0%{transform:scale(1);opacity:.72}100%{transform:scale(2.6);opacity:0}}
+      .bv-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid currentColor;
+        animation:bv-ring-out .9s ease-out forwards;pointer-events:none}
+
+      /* Orb breathe while BET is active */
+      @keyframes bv-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.055)}}
+      .bv-orb-breathe{animation:bv-breathe 1.8s ease-in-out infinite}
+
+      /* BET unlock radial burst */
+      @keyframes bv-burst{0%{opacity:.85;transform:scale(1)}100%{opacity:0;transform:scale(3)}}
+      .bv-burst{position:absolute;inset:0;border-radius:50%;
+        background:radial-gradient(circle,#00e5ff60 0%,#c97bff20 50%,transparent 70%);
+        animation:bv-burst .6s ease-out forwards;pointer-events:none}
+
+      /* Win / lose edge flash */
+      @keyframes bv-flash-win{
+        0%,100%{box-shadow:0 0 32px #00e5ff10,0 12px 40px #00000099}
+        35%{box-shadow:0 0 0 3px #00ff9450,0 0 52px #00ff9422,0 12px 40px #00000099}}
+      @keyframes bv-flash-lose{
+        0%,100%{box-shadow:0 0 32px #00e5ff10,0 12px 40px #00000099;transform:none}
+        20%{transform:translateX(-2px);box-shadow:0 0 0 3px #ff3d7150,0 12px 40px #00000099}
+        40%{transform:translateX(2px)}
+        60%{transform:none;box-shadow:0 0 0 3px #ff3d7130,0 12px 40px #00000099}}
+      .bv-flash-win{animation:bv-flash-win .75s ease-out forwards}
+      .bv-flash-lose{animation:bv-flash-lose .7s ease-out forwards}
+
+      /* New-shoe scan wipe across header */
+      @keyframes bv-scan-wipe{0%{left:0;opacity:.8}100%{left:100%;opacity:0}}
+      .bv-scan-wipe{position:absolute;top:0;bottom:0;width:3px;
+        background:linear-gradient(180deg,transparent,#ffffff,transparent);
+        pointer-events:none;animation:bv-scan-wipe .6s ease-in forwards}
+
+      /* Title shimmer via ::after */
+      .bv-logo{position:relative;display:inline-block}
+      .bv-logo::after{content:'';position:absolute;top:0;left:-110%;width:55%;height:100%;
+        background:linear-gradient(90deg,transparent,rgba(255,255,255,.26),transparent);
+        animation:bv-logo-shimmer 9s ease-in-out infinite;pointer-events:none}
+      @keyframes bv-logo-shimmer{0%,28%{left:-110%}58%,100%{left:230%}}
+
+      /* Title letter-spacing pulse on BET first-activate */
+      @keyframes bv-logo-widen{0%{letter-spacing:3px}40%{letter-spacing:7px}100%{letter-spacing:3px}}
+      .bv-logo-widen{animation:bv-logo-widen .75s ease-out}
+
+      /* BET badge glow pulse at ~1 Hz */
+      @keyframes bv-badge-glow{
+        0%,100%{box-shadow:0 0 5px #00e5ff28,inset 0 0 3px transparent}
+        50%{box-shadow:0 0 18px #00e5ff90,0 0 30px #00e5ff28,inset 0 0 7px #00e5ff18}}
+      .bv-badge-pulse{animation:bv-badge-glow 1s ease-in-out infinite}
+
+      /* Floating balance delta */
+      @keyframes bv-float{0%{transform:translateY(0);opacity:1}100%{transform:translateY(-32px);opacity:0}}
+      .bv-float-delta{position:fixed;font-size:13px;font-weight:800;pointer-events:none;
+        z-index:2147483648;animation:bv-float 1.1s ease-out forwards;white-space:nowrap;
+        font-family:'Cinzel','Palatino Linotype',serif;letter-spacing:.5px}
+
+      /* Dragon badge shake */
+      @keyframes bv-shake{0%,100%{transform:none}
+        18%{transform:translateX(-4px)}38%{transform:translateX(4px)}
+        55%{transform:translateX(-3px)}72%{transform:translateX(3px)}}
+      .bv-shake{animation:bv-shake .48s ease-in-out}
+
+      /* Bead row pop-in + streak wave */
+      @keyframes bv-bead-pop{0%{transform:scale(0)}62%{transform:scale(1.45)}100%{transform:scale(1)}}
+      @keyframes bv-bead-wave{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+      .bv-bead{display:inline-block;width:10px;height:10px;border-radius:50%;
+        margin:2px 2px;vertical-align:middle;flex-shrink:0}
+      .bv-bead-new{animation:bv-bead-pop .24s ease-out both}
+      .bv-bead-wave{animation:bv-bead-wave .65s ease-in-out infinite}
+
+      /* Section header first-data sweep */
+      @keyframes bv-sweep{0%{left:-100%;opacity:.7}100%{left:210%;opacity:0}}
+      .bv-sweep{position:absolute;top:0;bottom:0;left:-100%;width:55%;
+        background:linear-gradient(90deg,transparent,#00e5ff1a,transparent);
+        pointer-events:none;animation:bv-sweep .55s ease-out forwards}
+
+      /* Chevron open / close bounce */
+      @keyframes bv-chev-down{0%,100%{transform:translateY(0)}42%{transform:translateY(3px)}72%{transform:translateY(-1px)}}
+      @keyframes bv-chev-up{0%,100%{transform:translateY(0)}42%{transform:translateY(-3px)}72%{transform:translateY(1px)}}
+      .bv-chev-open{animation:bv-chev-down .32s ease-out}
+      .bv-chev-close{animation:bv-chev-up .32s ease-out}
+
+      /* Bar fill shimmer glint */
+      @keyframes bv-glint{0%{left:-80%;opacity:0}15%{opacity:.45}80%{opacity:.3}100%{left:130%;opacity:0}}
+      .bv-bar-fill{position:relative;overflow:hidden}
+      .bv-bar-fill::after{content:'';position:absolute;top:0;bottom:0;left:-80%;width:40%;
+        background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);
+        animation:bv-glint 2.6s ease-in-out infinite;pointer-events:none}
+
+      /* Rotating neon border ring — slow hue cycle (30 s) */
+      @keyframes bv-ring-hue{
+        0%{border-color:#00e5ff28}25%{border-color:#c97bff22}
+        50%{border-color:#00ff9422}75%{border-color:#ffd70018}100%{border-color:#00e5ff28}}
+      #bv-border-ring{position:absolute;inset:0;border-radius:13px;
+        border:1px solid #00e5ff28;pointer-events:none;z-index:0;
+        animation:bv-ring-hue 30s linear infinite;
+        transition:border-color 1.5s ease,box-shadow 1.5s ease}
     `;
     document.head.appendChild(s);
   }
@@ -599,6 +781,10 @@
     injectCSS();
     panel = document.createElement("div");
     panel.id = "bv-panel";
+    // Animated neon border ring — sits below all content (z-index:0)
+    const _bvBorderRing = document.createElement("div");
+    _bvBorderRing.id = "bv-border-ring";
+    panel.appendChild(_bvBorderRing);
 
     // ── Header (drag handle + minimize) ──
     const hdr = document.createElement("div");
@@ -714,6 +900,20 @@
     setStatus(`H${counter.hand} · ${counter.P}P ${counter.B}B ${counter.T}T`);
     if (_minimised) return;
 
+    // ── New shoe scan wipe ──────────────────────────────────────────────────
+    if (_prevHandNum > 5 && counter.hand <= 2) {
+      _handHistory = [];
+      _sectionInited = {};
+      scanNewShoe();
+    }
+    _prevHandNum = counter.hand;
+
+    // ── Append this hand to local bead history ──────────────────────────────
+    if (hand && hand.winner) {
+      _handHistory.push(hand.winner);
+      if (_handHistory.length > 14) _handHistory.shift();
+    }
+
     if (!data) {
       const el = $("pick");
       if (el) el.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f00;font-size:11px">${icon("alert-triangle",13,"#ff9f00")} Engine offline — run the server</div>`;
@@ -728,18 +928,46 @@
     const pat = data.pattern;
     const cur = (st && st.currency) || (bk && bk.currency) || "";
 
+    // ── Win / lose edge flash ───────────────────────────────────────────────
+    if (hand && session.betSignalledPick) {
+      const winnerMap = { player: "P", banker: "B", tie: "T" };
+      edgeFlash(hand.winner === winnerMap[session.betSignalledPick] ? "win" : "lose");
+    }
+
+    // ── Regime border ───────────────────────────────────────────────────────
+    const _regimeColors = { Dragon:"#ff3d71", Choppy:"#00ff94", Mixed:"#ffd700", Forming:"#c97bff" };
+    const _regimeCol = pat && _regimeColors[pat.personality];
+    const _bRing = panel && panel.querySelector("#bv-border-ring");
+    if (_bRing) {
+      if (_regimeCol) {
+        _bRing.style.borderColor = _regimeCol + "45";
+        _bRing.style.boxShadow   = `0 0 20px ${_regimeCol}18`;
+        _bRing.style.animationPlayState = "paused";
+      } else {
+        _bRing.style.borderColor = "";
+        _bRing.style.boxShadow   = "";
+        _bRing.style.animationPlayState = "";
+      }
+    }
+
     // ── Next Pick ────────────────────────────────────────────────────────── //
     const pickEl = $("pick");
     if (pickEl && m && m.pick) {
+      if (!_sectionInited.pick) { sweepSection("pick"); _sectionInited.pick = true; }
+
       const col = m.confident ? (BET_COLOR[m.pick] || "#b0b8d8") : "#4a5070";
-      // Single letter inside the orb — large and unmistakable
       const letter = m.pick === "banker" ? "B" : m.pick === "player" ? "P"
                    : m.pick === "tie"    ? "T" : m.pick[0].toUpperCase();
+      // Badge includes pulse class when BET is active (drives 1 Hz glow)
       const badge = m.confident
-        ? `<span class="bv-badge bv-badge-bet">${icon("diamond",9,"#00e5ff")} BET</span>`
+        ? `<span class="bv-badge bv-badge-bet bv-badge-pulse">${icon("diamond",9,"#00e5ff")} BET</span>`
         : `<span class="bv-badge bv-badge-opt">WAIT</span>`;
       const stakeStr = st ? `${fmtK(st.stake)}${cur ? " " + cur : ""}` : "—";
       const vibe = m.vibe || 0;
+
+      // Unlock arc — shown as a circular progress ring around the orb while waiting
+      const showArc = !m.confident && L && (L.acts || 0) > 0;
+      const arcPct  = showArc ? Math.min(1, (L.acts || 0) / (L.min_hands || 15)) : 0;
 
       let unlockHtml = "";
       if (L) {
@@ -758,12 +986,16 @@
       const reasons = (m.reasons || []).slice(0, 2)
         .map((r) => `<div class="bv-reason">• ${r}</div>`).join("");
 
-      // Orb uses filter:drop-shadow — this creates a circular glow that is NOT
-      // clipped by overflow:hidden on any ancestor (unlike box-shadow or text-shadow).
+      const orbClass = m.confident ? "bv-orb bv-orb-breathe" : "bv-orb";
+
       pickEl.innerHTML =
         `<div style="display:flex;align-items:center;gap:14px;padding:4px 2px 10px">` +
-        `<div class="bv-orb" style="background:${col}16;border:2px solid ${col}50;` +
-        `filter:drop-shadow(0 0 14px ${col});color:${col}">${letter}</div>` +
+        // Orb wrapper — position:relative lets arc SVG and ring/burst children anchor here
+        `<div id="bv-orb-wrap" style="position:relative;width:62px;height:62px;flex-shrink:0">` +
+        `<div class="${orbClass}" style="width:100%;height:100%;background:${col}16;` +
+        `border:2px solid ${col}50;filter:drop-shadow(0 0 14px ${col});color:${col}">${letter}</div>` +
+        (showArc ? arcSvg(arcPct) : "") +
+        `</div>` +
         `<div style="flex:1;min-width:0">` +
         `<div style="font-family:'Cinzel','Palatino Linotype',serif;font-size:19px;font-weight:700;` +
         `color:${col};letter-spacing:.5px;line-height:1.1;margin-bottom:6px;white-space:nowrap;` +
@@ -777,11 +1009,34 @@
         `<span class="bv-lbl">Confidence</span>` +
         `<span class="bv-val" style="color:${col}">${(vibe * 100).toFixed(0)}%</span></div>` +
         unlockHtml + reasons;
+
+      // Post-render: radar ping on every hand
+      const orbWrap = pickEl.querySelector("#bv-orb-wrap");
+      pingOrb(orbWrap);
+
+      // BET first-activate: radial burst + title letter-spacing widen
+      if (m.confident && !_prevConfident) {
+        if (orbWrap) {
+          const b = document.createElement("div");
+          b.className = "bv-burst";
+          orbWrap.appendChild(b);
+          setTimeout(() => b.remove(), 680);
+        }
+        const logo = panel && panel.querySelector(".bv-logo");
+        if (logo) {
+          logo.classList.remove("bv-logo-widen");
+          void logo.offsetWidth;
+          logo.classList.add("bv-logo-widen");
+          setTimeout(() => logo.classList.remove("bv-logo-widen"), 800);
+        }
+      }
+      _prevConfident = m.confident;
     }
 
     // ── Bet Spread ───────────────────────────────────────────────────────── //
     const spreadEl = $("spread");
     if (spreadEl) {
+      if (!_sectionInited.spread && ds && ds.legs && ds.legs.length) { sweepSection("spread"); _sectionInited.spread = true; }
       let html = "";
 
       // Dynamic spread (probability-driven, has EV)
@@ -888,14 +1143,33 @@
     // ── Pattern ──────────────────────────────────────────────────────────── //
     const patEl = $("pattern");
     if (patEl && pat) {
+      if (!_sectionInited.pattern) { sweepSection("pattern"); _sectionInited.pattern = true; }
+
       const since = pat.hands_since || {};
+      const dragonBadge = pat.is_dragon
+        ? ` <span class="bv-dragon-badge" style="font-size:9px;font-weight:800;color:#ff3d71;letter-spacing:.5px">DRAGON</span>`
+        : "";
       const streakTxt = pat.streak_len > 1
-        ? `${pat.streak_len}× ${pat.streak_side}${pat.is_dragon ? ` <span style="font-size:9px;font-weight:800;color:#ff3d71;letter-spacing:.5px">DRAGON</span>` : ""}`
+        ? `${pat.streak_len}× ${pat.streak_side}${dragonBadge}`
         : "none";
       const chopPct = (pat.chop_score * 100).toFixed(0);
       const chopCol = pat.chop_score > 0.6 ? "#00ff94" : pat.chop_score > 0.35 ? "#ffd700" : "#ff6b6b";
       const persColor = { Dragon: "#ff3d71", Choppy: "#00ff94", Mixed: "#ffd700", Forming: "#c97bff" }[pat.personality] || "#4a5070";
       const shoes = (data.library && data.library.shoes) ? data.library.shoes : 0;
+
+      // Animated bead row — last 14 hands, newest bead pops in, streak beads wave
+      const beadCols = { P:"#00b4ff", B:"#ff3d71", T:"#00ff94" };
+      const beadHtml = _handHistory.length
+        ? `<div style="display:flex;flex-wrap:wrap;align-items:center;margin-top:8px;gap:0">` +
+          _handHistory.map((w, i) => {
+            const isNew = hand && i === _handHistory.length - 1;
+            const inStreak = pat.streak_len > 1 && i >= _handHistory.length - pat.streak_len && !isNew;
+            const cls = `bv-bead${isNew ? " bv-bead-new" : inStreak ? " bv-bead-wave" : ""}`;
+            const wdly = inStreak ? `animation-delay:${(i % pat.streak_len) * 0.11}s;` : "";
+            const col  = beadCols[w] || "#5a6080";
+            return `<span class="${cls}" style="background:${col};box-shadow:0 0 5px ${col}55;${wdly}" title="${w}"></span>`;
+          }).join("") + `</div>`
+        : "";
 
       patEl.innerHTML =
         `<div class="bv-row">` +
@@ -908,17 +1182,31 @@
         `<span class="bv-lbl">Chop score</span>` +
         `<span class="bv-val" style="color:${chopCol}">${chopPct}%</span></div>` +
         bar(pat.chop_score, chopCol, 3) +
+        beadHtml +
         `<div class="bv-row" style="margin-top:4px">` +
         `<span class="bv-lbl">Last Tie / P / B</span>` +
         `<span class="bv-val">${since.T ?? "?"}h · ${since.P ?? "?"}h · ${since.B ?? "?"}h ago</span></div>` +
         (shoes ? `<div class="bv-row"><span class="bv-lbl">Shoe library</span>` +
         `<span class="bv-val" style="color:#4a5070">${shoes} logged</span></div>` : "") +
         renderTemplateMatch(data.template_match);
+
+      // Dragon onset shake
+      if (pat.is_dragon && !_prevDragon) {
+        const badge = patEl.querySelector(".bv-dragon-badge");
+        if (badge) {
+          badge.classList.remove("bv-shake");
+          void badge.offsetWidth;
+          badge.classList.add("bv-shake");
+          setTimeout(() => badge && badge.classList.remove("bv-shake"), 520);
+        }
+      }
+      _prevDragon = !!pat.is_dragon;
     }
 
     // ── AI Engine ────────────────────────────────────────────────────────── //
     const modelEl = $("model");
     if (modelEl) {
+      if (!_sectionInited.model && L && L.graded > 0) { sweepSection("model"); _sectionInited.model = true; }
       if (L && L.graded > 0) {
         const edge = (L.accuracy - L.baseline_accuracy) * 100;
         const edgeCol = edge >= 0 ? "#00ff94" : "#ff3d71";
@@ -954,11 +1242,19 @@
     // ── Balance ──────────────────────────────────────────────────────────── //
     const balEl = $("balance");
     if (balEl) {
+      if (!_sectionInited.balance && bk && bk.balance) { sweepSection("balance"); _sectionInited.balance = true; }
       if (bk && bk.currency && bk.balance) {
+        // Floating delta on balance change
+        if (_prevBalanceAnim !== null && bk.balance !== _prevBalanceAnim) {
+          const diff = bk.balance - _prevBalanceAnim;
+          const sign = diff >= 0 ? "+" : "-";
+          floatDelta(`${sign}${fmtK(Math.abs(diff))}`, diff >= 0 ? "#00ff94" : "#ff3d71", balEl);
+        }
+        _prevBalanceAnim = bk.balance;
+
         const delta = (bk.balance != null && bk.shoe_start != null) ? bk.balance - bk.shoe_start : null;
         const deltaCol = delta == null ? "" : delta >= 0 ? "#00ff94" : "#ff3d71";
         balEl.innerHTML =
-          // Large balance headline
           `<div style="font-size:20px;font-weight:800;color:#00e5ff;letter-spacing:.3px;` +
           `margin-bottom:2px">${fmtK(bk.balance)} <span style="font-size:12px;` +
           `font-weight:600;color:#3a5070">${bk.currency}</span></div>` +
