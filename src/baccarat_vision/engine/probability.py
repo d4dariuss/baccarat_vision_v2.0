@@ -311,6 +311,55 @@ def suited_pair_probability(decks: int = 8) -> float:
     return 52 * comb(decks, 2) / comb(total, 2)
 
 
+def live_pair_probabilities(counts: Tuple[int, ...], decks: int = 8) -> dict:
+    """Pair probabilities from the current remaining shoe value counts.
+
+    The shoe tracks *value* counts (indices 0-9). Value 0 = 10/J/Q/K (4 ranks),
+    values 1-9 = one rank each. We approximate rank-level counts by assuming the
+    four 10-value ranks deplete uniformly, which holds for a randomly dealt shoe.
+
+    Returns: player_pair, banker_pair, either_pair, baseline_player_pair,
+             baseline_either_pair.
+    """
+    baseline_pp = pair_probability(decks)
+    baseline_ep = either_pair_probability(decks)
+    total = sum(counts)
+    if total < 4:
+        return {
+            "player_pair": baseline_pp, "banker_pair": baseline_pp,
+            "either_pair": baseline_ep,
+            "baseline_player_pair": baseline_pp, "baseline_either_pair": baseline_ep,
+        }
+    # Rank-level counts: value 0 → 4 equal-share ranks; values 1-9 → one rank each.
+    rank_counts: List[float] = []
+    for v, c in enumerate(counts):
+        if v == 0:
+            per_rank = c / 4.0
+            rank_counts.extend([per_rank] * 4)
+        else:
+            rank_counts.append(float(c))
+    n = float(total)
+    denom = n * (n - 1)
+    if denom <= 0:
+        return {
+            "player_pair": baseline_pp, "banker_pair": baseline_pp,
+            "either_pair": baseline_ep,
+            "baseline_player_pair": baseline_pp, "baseline_either_pair": baseline_ep,
+        }
+    # P(one two-card hand is a rank pair) = Σ_r c_r*(c_r-1) / (n*(n-1))
+    pair_sum = sum(c * (c - 1) for c in rank_counts)
+    p_pair = pair_sum / denom
+    # P(either of the two hands is a pair) — approximate with independent draws.
+    p_either = 1.0 - (1.0 - p_pair) ** 2
+    return {
+        "player_pair": p_pair,
+        "banker_pair": p_pair,
+        "either_pair": p_either,
+        "baseline_player_pair": baseline_pp,
+        "baseline_either_pair": baseline_ep,
+    }
+
+
 def suited_pair_states(decks: int = 8) -> Tuple[float, float, float]:
     """Return (P_neither, P_exactly_one, P_both) suited pairs across both hands."""
     total = CARDS_PER_DECK * decks

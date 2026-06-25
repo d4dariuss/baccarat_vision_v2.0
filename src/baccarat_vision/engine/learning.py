@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from .patterns import PatternState
+from .patterns import PatternState, derived_road_signals
 
 _BET = {"P": "player", "B": "banker"}
 _OPP = {"P": "B", "B": "P"}
@@ -122,6 +122,35 @@ def _flat_player(s, lib=None):
     return "player"
 
 
+def _road_big_eye(s, lib=None):
+    r = derived_road_signals(s.pb_sequence).get("big_eye_boy")
+    return _BET.get(r) if r else None
+
+
+def _road_small(s, lib=None):
+    r = derived_road_signals(s.pb_sequence).get("small_road")
+    return _BET.get(r) if r else None
+
+
+def _road_cockroach(s, lib=None):
+    r = derived_road_signals(s.pb_sequence).get("cockroach")
+    return _BET.get(r) if r else None
+
+
+def _template_match(s, lib=None):
+    """Template-match expert: find historically similar shoes and predict continuation."""
+    if lib is None:
+        return None
+    try:
+        result = lib.template_prediction(s.sequence)
+        if result and result.get("confidence", 0.0) >= 0.10:
+            pick = result.get("pick")
+            return {"P": "player", "B": "banker"}.get(pick)
+    except Exception:
+        pass
+    return None
+
+
 EXPERTS: Dict[str, Callable] = {
     "ride-dragon": _ride,
     "fade-streak": _fade,
@@ -136,6 +165,10 @@ EXPERTS: Dict[str, Callable] = {
     "zipper": _zipper,
     "flat-banker": _flat_banker,
     "flat-player": _flat_player,
+    "road-big-eye": _road_big_eye,
+    "road-small": _road_small,
+    "road-cockroach": _road_cockroach,
+    "template-match": _template_match,
 }
 
 # Shoe personalities (must match patterns.analyze_patterns). Each gets its own
@@ -363,6 +396,39 @@ class OnlineLearner:
             g = grade(bet, o)
             if g is not None:
                 self._accrue(self.bet_stats[bet], g)
+
+    def vote_summary(self, bets: Dict[str, Optional[str]], regime: Optional[str] = None) -> dict:
+        """Return expert vote breakdown for the current hand.
+
+        Returns: pick, votes (total weight per bet), breakdown (expert count per bet),
+                 agreement (weight fraction for pick), top_dissent (up to 2 dissenting names).
+        """
+        wv = self._wv(regime)
+        votes: Dict[str, float] = defaultdict(float)
+        breakdown: Dict[str, int] = defaultdict(int)
+        for n, b in bets.items():
+            if b:
+                votes[b] += wv.get(n, 1.0)
+                breakdown[b] += 1
+        if not votes:
+            return {
+                "pick": "banker", "votes": {}, "breakdown": {},
+                "agreement": 0.0, "top_dissent": [],
+            }
+        pick = max(votes, key=votes.get)
+        total = sum(votes.values())
+        agreement = votes[pick] / total if total else 0.0
+        dissenting = sorted(
+            [n for n, b in bets.items() if b and b != pick],
+            key=lambda n: wv.get(n, 1.0), reverse=True,
+        )
+        return {
+            "pick": pick,
+            "votes": dict(votes),
+            "breakdown": dict(breakdown),
+            "agreement": agreement,
+            "top_dissent": dissenting[:2],
+        }
 
     def reasons_for(self, pick: str, bets, regime: Optional[str] = None) -> List[str]:
         wv = self._wv(regime)

@@ -133,6 +133,51 @@ def analyze_patterns(
     )
 
 
+def derived_road_signals(pb_sequence: List[str]) -> dict:
+    """Big Eye Boy, Small Road, Cockroach road signals from P/B sequence.
+
+    Each derived road compares the last completed run to an earlier run:
+      Big Eye Boy — compare to 2 columns ago (offset 1)
+      Small Road  — compare to 3 columns ago (offset 2)
+      Cockroach   — compare to 4 columns ago (offset 3)
+
+    Same length → current side continues (red).
+    Different length → switch (blue).
+    Returns None for each road that doesn't have enough history.
+    """
+    if not pb_sequence:
+        return {"big_eye_boy": None, "small_road": None, "cockroach": None}
+
+    # Build list of completed runs and track the current in-progress side.
+    runs: List[tuple] = []
+    cur_side = pb_sequence[0]
+    cur_len = 1
+    for s in pb_sequence[1:]:
+        if s == cur_side:
+            cur_len += 1
+        else:
+            runs.append((cur_side, cur_len))
+            cur_side = s
+            cur_len = 1
+    # cur_side is the in-progress run (not yet a completed column).
+
+    def _signal(offset: int) -> Optional[str]:
+        """Compare last completed run length to run offset+1 positions ago."""
+        if len(runs) < offset + 2:
+            return None
+        last_len = runs[-1][1]
+        ref_len = runs[-(offset + 1)][1]
+        if last_len == ref_len:
+            return cur_side           # red — continue current side
+        return "P" if cur_side == "B" else "B"  # blue — switch
+
+    return {
+        "big_eye_boy": _signal(1),
+        "small_road":  _signal(2),
+        "cockroach":   _signal(3),
+    }
+
+
 @dataclass
 class MysticConfig:
     dragon_ride_max: int = 6      # ride a streak up to this length

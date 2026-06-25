@@ -46,6 +46,27 @@ class StakeSuggestion:
         return self.stake + sum(s["stake"] for s in self.side_bets)
 
 
+def kelly_stake(
+    p_win: float,
+    net_odds: float,
+    bankroll: float,
+    fraction: float = 0.25,
+    min_bet: float = 0.0,
+) -> float:
+    """Fractional Kelly stake from estimated edge.
+
+    fraction=0.25 (quarter-Kelly) reduces variance for model uncertainty.
+    Returns 0 when the Kelly fraction is negative (no edge on this side).
+    """
+    if p_win <= 0 or bankroll <= 0 or net_odds <= 0:
+        return 0.0
+    q = 1.0 - p_win
+    kelly_f = (net_odds * p_win - q) / net_odds
+    if kelly_f <= 0:
+        return 0.0
+    return max(min_bet, fraction * kelly_f * bankroll)
+
+
 def build_spread(side: str, unit: float, balance: float) -> Tuple[str, List[dict], float, bool]:
     """Scale the named preset for ``side`` by the chip ``unit``.
 

@@ -44,9 +44,15 @@ class ShoeLibrary:
             "b_pair INTEGER, p_suited INTEGER, b_suited INTEGER, is_natural INTEGER, "
             "margin INTEGER, cards TEXT)"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS calibration ("
+            "id INTEGER PRIMARY KEY, created_at REAL, confidence_bin INTEGER, "
+            "pick TEXT, winner TEXT, hit INTEGER)"
+        )
         self._conn.commit()
         self._cache: Optional[Dict] = None
         self._vision_cache: Optional[List[dict]] = None
+        self._seq_cache: Optional[List[str]] = None
 
     # -- rich per-hand storage (full vision) ------------------------------- #
     def archive_shoe(self, records: List[dict], sequence: List[str]) -> int:
@@ -67,6 +73,7 @@ class ShoeLibrary:
             )
         self._conn.commit()
         self._vision_cache = None
+        self._seq_cache = None
         return shoe_id
 
     def vision_stats(self) -> List[dict]:
@@ -123,6 +130,7 @@ class ShoeLibrary:
             self._conn.execute("DELETE FROM shoes WHERE id=?", (sid,))
         self._conn.commit()
         self._cache = None
+        self._seq_cache = None
         self._vision_cache = None
         return len(ids)
 
@@ -158,11 +166,14 @@ class ShoeLibrary:
         )
         self._conn.commit()
         self._cache = None  # invalidate empirics
+        self._seq_cache = None  # invalidate sequence cache
         return cur.lastrowid
 
     # -- reading ----------------------------------------------------------- #
     def all_sequences(self) -> List[str]:
-        return [row[0] for row in self._conn.execute("SELECT sequence FROM shoes")]
+        if self._seq_cache is None:
+            self._seq_cache = [row[0] for row in self._conn.execute("SELECT sequence FROM shoes")]
+        return self._seq_cache
 
     def _empirics(self) -> Dict:
         if self._cache is not None:
@@ -204,7 +215,103 @@ class ShoeLibrary:
 
     def stats(self) -> Dict[str, int]:
         e = self._empirics()
-        return {"shoes": e["shoes"], "hands": e["total_hands"]}
+        cal_n = self._conn.execute("SELECT COUNT(*) FROM calibration").fetchone()[0]
+        return {"shoes": e["shoes"], "hands": e["total_hands"], "calibration_hands": cal_n}
+
+    # -- calibration -------------------------------------------------------- #
+    def record_calibration(self, confidence: float, pick: str, winner: str, hit: bool) -> None:
+        """Record one prediction outcome for calibration tracking."""
+        bin_ = min(9, int(max(0.0, confidence) * 10))
+        self._conn.execute(
+            "INSERT INTO calibration (created_at, confidence_bin, pick, winner, hit) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (time.time(), bin_, pick, winner, 1 if hit else 0),
+        )
+        self._conn.commit()
+
+    def calibration_curve(self) -> List[dict]:
+        """Return calibration stats per confidence bin (only bins with n >= 5)."""
+        rows = self._conn.execute(
+            "SELECT confidence_bin, COUNT(*) as n, SUM(hit) as hits "
+            "FROM calibration GROUP BY confidence_bin ORDER BY confidence_bin"
+        ).fetchall()
+        result = []
+        for bin_, n, hits in rows:
+            if n >= 5:
+                expected = (bin_ + 0.5) / 10.0  # midpoint of the 10-pct-wide bin
+                actual = hits / n if n else 0.0
+                result.append({
+                    "bin": bin_,
+                    "bin_label": f"{bin_ * 10}-{(bin_ + 1) * 10}%",
+                    "expected_rate": expected,
+                    "actual_rate": actual,
+                    "n": n,
+                })
+        return result
+
+    # -- template matching ------------------------------------------------- #
+    def find_similar_shoes(
+        self, sequence: List[str], k: int = 5, window: int = 15
+    ) -> List[dict]:
+        """Find k historical shoes most similar to the first `window` hands of sequence.
+
+        Similarity: fraction of positions where outcomes match (T treated as wildcard).
+        Only considers historical shoes with at least window+5 hands.
+        """
+        cur = [s for s in sequence if s in ("P", "B", "T")][:window]
+        if len(cur) < 5:
+            return []
+        n_cur = len(cur)
+        matches = []
+        for seq in self.all_sequences():
+            if len(seq) < window + 5:
+                continue
+            hist = list(seq[:n_cur])
+            match_score = 0
+            for i in range(min(n_cur, len(hist))):
+                c, h = cur[i], hist[i]
+                if c == h or c == "T" or h == "T":
+                    match_score += 1
+            similarity = match_score / n_cur
+            next_hands = list(seq[window: window + 20])
+            n_next = len(next_hands)
+            if n_next == 0:
+                continue
+            matches.append({
+                "similarity": similarity,
+                "continuation_b": next_hands.count("B") / n_next,
+                "continuation_p": next_hands.count("P") / n_next,
+                "continuation_t": next_hands.count("T") / n_next,
+                "total_hands": len(seq),
+                "next_10": "".join(next_hands[:10]),
+            })
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+        return matches[:k]
+
+    def template_prediction(
+        self, sequence: List[str], window: int = 15
+    ) -> Optional[dict]:
+        """Aggregate continuation rates from similar shoes into one prediction.
+
+        Returns None if fewer than 3 similar shoes are found.
+        """
+        matches = self.find_similar_shoes(sequence, k=10, window=window)
+        if len(matches) < 3:
+            return None
+        total_sim = sum(m["similarity"] for m in matches)
+        if total_sim <= 0:
+            return None
+        b_pct = sum(m["continuation_b"] * m["similarity"] for m in matches) / total_sim
+        p_pct = sum(m["continuation_p"] * m["similarity"] for m in matches) / total_sim
+        t_pct = sum(m["continuation_t"] * m["similarity"] for m in matches) / total_sim
+        # Confidence = gap between best and second-best continuation rate.
+        sorted_rates = sorted([b_pct, p_pct, t_pct], reverse=True)
+        gap = sorted_rates[0] - sorted_rates[1] if len(sorted_rates) >= 2 else 0.0
+        pick = max([("B", b_pct), ("P", p_pct), ("T", t_pct)], key=lambda x: x[1])[0]
+        return {
+            "pick": pick, "confidence": gap, "n_matches": len(matches),
+            "b_pct": b_pct, "p_pct": p_pct, "t_pct": t_pct,
+        }
 
     def close(self) -> None:
         try:

@@ -80,6 +80,9 @@ class DashboardState:
     dynamic_spread: Optional[DynamicSpread] = None
     bankroll: Dict[str, object] = field(default_factory=dict)
     vision: List[dict] = field(default_factory=list)  # side-bet history (full vision)
+    vote_summary: Optional[dict] = None
+    template_match: Optional[dict] = None
+    calibration: List[dict] = field(default_factory=list)
 
 
 class AppController:
@@ -129,6 +132,8 @@ class AppController:
             "shoe_start_balance": None, "suggested_pnl": 0.0,
         }
         self._last_stake: Optional[StakeSuggestion] = None  # to grade for PnL
+        self._last_vibe: float = 0.0    # mystic vibe from last snapshot (for calibration)
+        self._last_pick: Optional[str] = None  # mystic pick from last snapshot
 
     def set_context(self, *, currency=None, balance=None, denoms=None,
                     min_bet=None, max_bet=None, strategy=None,
@@ -175,6 +180,14 @@ class AppController:
                 try:
                     self.library.save_learner(self.learner.to_dict())
                     self.library.record_prediction(pick, hand.winner, won, units)
+                    if self._last_pick is not None:
+                        pick_char = {"player": "P", "banker": "B", "tie": "T"}.get(
+                            self._last_pick, self._last_pick
+                        )
+                        self.library.record_calibration(
+                            self._last_vibe, self._last_pick, hand.winner,
+                            pick_char == hand.winner,
+                        )
                 except Exception:
                     pass
 
@@ -337,22 +350,33 @@ class AppController:
                     min_bet=bk["min_bet"],
                     max_bet=bk["max_bet"],
                     currency=bk["currency"],
+                    counts=tuple(self.shoe.remaining),
+                    decks=self.config.decks_per_shoe,
                 )
             except Exception:
                 pass
+
+        # Store last mystic pick/vibe for calibration recording on next enter_hand().
+        self._last_vibe = mystic.vibe if mystic else 0.0
+        self._last_pick = mystic.pick if mystic else None
+
+        # Expert vote breakdown.
+        vote_summary = self.learner.vote_summary(bets, regime=pattern.personality)
 
         bankroll_summary = {
             "currency": bk["currency"], "balance": bk["balance"],
             "shoe_start": bk["shoe_start_balance"], "suggested_pnl": bk["suggested_pnl"],
             "strategy": bk["strategy"], "consec_losses": bk["consec_losses"],
         }
-        library_stats, vision = {}, []
+        library_stats, vision, calibration, template_match = {}, [], [], None
         if self.library is not None:
             try:
                 library_stats = self.library.stats()
                 vision = self.library.vision_stats()
+                calibration = self.library.calibration_curve()
+                template_match = self.library.template_prediction(self.sequence)
             except Exception:
-                library_stats, vision = {}, []
+                library_stats, vision, calibration, template_match = {}, [], [], None
 
         return DashboardState(
             prediction=prediction,
@@ -375,4 +399,7 @@ class AppController:
             dynamic_spread=dyn_spread,
             bankroll=bankroll_summary,
             vision=vision,
+            vote_summary=vote_summary,
+            template_match=template_match,
+            calibration=calibration,
         )

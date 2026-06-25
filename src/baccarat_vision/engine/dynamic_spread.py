@@ -40,6 +40,7 @@ from .probability import (
     BASELINE_P_TIE,
     analyze_shoe,
     full_shoe_value_counts,
+    live_pair_probabilities,
 )
 
 # ── Baseline constants (computed once, cached) ───────────────────────────── #
@@ -106,6 +107,9 @@ class DynamicSpread:
     note: str
     currency: str = ""
     affordable: bool = True
+    pair_probs: dict = field(default_factory=dict)   # live pair probabilities
+    kelly_stake: float = 0.0                          # 25%-Kelly stake (in currency)
+    kelly_fraction: float = 0.0                       # raw Kelly fraction
 
 
 # ── Bonus payout ladder (default; mirrors PayoutTable defaults) ───────────── #
@@ -132,6 +136,11 @@ def _ev_super6(p_b6: float) -> float:
 
 def _ev_either_pair(p_ep: float) -> float:
     return p_ep * 5.0 - (1.0 - p_ep)
+
+
+def _ev_pair(p_pair: float) -> float:
+    """EV for player_pair or banker_pair bet (pays 11:1)."""
+    return p_pair * 11.0 - (1.0 - p_pair)
 
 
 def _ev_b_bonus(distribution: dict) -> float:
@@ -182,16 +191,18 @@ def _snap(amount: float, unit: float) -> float:
 # ── Main engine ───────────────────────────────────────────────────────────── #
 def compute_dynamic_spread(
     *,
-    analysis,           # ShoeAnalysis from analyze_shoe()
-    prediction,         # Prediction from Predictor.predict()
-    learning,           # Scoreboard from OnlineLearner.scoreboard()
-    mystic,             # MysticAdvice from controller.snapshot()
+    analysis,                    # ShoeAnalysis from analyze_shoe()
+    prediction,                  # Prediction from Predictor.predict()
+    learning,                    # Scoreboard from OnlineLearner.scoreboard()
+    mystic,                      # MysticAdvice from controller.snapshot()
     penetration: float,
     balance: float,
     denoms: List[float],
     min_bet: float,
     max_bet: float,
     currency: str,
+    counts: tuple = (),          # current shoe value counts (len 10) for live pair probs
+    decks: int = 8,
 ) -> DynamicSpread:
     """Compute a probability-driven bet spread for the next hand.
 
@@ -304,20 +315,78 @@ def compute_dynamic_spread(
         ))
         remaining_cap -= t_stake
 
-    # ── Either Pair — learner-significant edge only ───────────────────────── #
-    if remaining_cap >= unit and learning:
+    # ── Live pair probabilities from shoe composition ─────────────────────── #
+    if counts and len(counts) == 10:
+        pair_probs = live_pair_probabilities(tuple(counts), decks)
+    else:
+        pair_probs = {}
+
+    live_pp = pair_probs.get("player_pair", 0.0)
+    live_ep = pair_probs.get("either_pair", 0.0)
+    baseline_pp = pair_probs.get("baseline_player_pair", 0.0)
+    baseline_ep = pair_probs.get("baseline_either_pair", 0.0)
+    pair_elevated = baseline_ep > 0 and live_ep > 0 and (live_ep / baseline_ep) >= 1.08
+    pp_elevated = baseline_pp > 0 and live_pp > 0 and (live_pp / baseline_pp) >= 1.10
+
+    # Learner either-pair edge check
+    learner_ep_sig = False
+    learner_ep_per100 = 0.0
+    if learning:
         for rec in (learning.bets or []):
             if rec.get("bet") == "either_pair" and rec.get("significant"):
-                ep_stake = unit
-                legs.append(SpreadLeg(
-                    bet="either_pair", label="Either Pair",
-                    stake=ep_stake, units=1.0,
-                    ev=rec.get("per100", 0.0) / 100.0 * ep_stake,
-                    reason=f"learner edge +{rec.get('per100', 0.0):.1f}u/100 "
-                           f"(n={rec.get('n', 0)})",
-                ))
-                remaining_cap -= ep_stake
+                learner_ep_sig = True
+                learner_ep_per100 = rec.get("per100", 0.0)
                 break
+
+    # ── Either Pair — elevated composition OR learner-significant edge ────── #
+    if remaining_cap >= unit and (pair_elevated or learner_ep_sig):
+        ep_stake = unit
+        if pair_elevated:
+            ep_reason = (
+                f"pair prob {live_ep*100:.1f}% "
+                f"(+{((live_ep / baseline_ep) - 1)*100:.0f}% vs baseline)"
+            )
+            ep_ev = _ev_either_pair(live_ep)
+        else:
+            ep_reason = f"learner edge +{learner_ep_per100:.1f}u/100"
+            ep_ev = learner_ep_per100 / 100.0
+        legs.append(SpreadLeg(
+            bet="either_pair", label="Either Pair",
+            stake=ep_stake, units=1.0,
+            ev=ep_ev * ep_stake,
+            reason=ep_reason,
+        ))
+        remaining_cap -= ep_stake
+
+    # ── Player / Banker Pair — when specific pair probability elevated ≥10% ─ #
+    if remaining_cap >= unit and pp_elevated:
+        pp_reason = (
+            f"pair {live_pp*100:.1f}% "
+            f"(+{((live_pp / baseline_pp) - 1)*100:.0f}% vs baseline)"
+        )
+        if main_side == "player":
+            legs.append(SpreadLeg(
+                bet="player_pair", label="P Pair",
+                stake=unit, units=1.0,
+                ev=_ev_pair(live_pp) * unit,
+                reason="P " + pp_reason,
+            ))
+        else:
+            legs.append(SpreadLeg(
+                bet="banker_pair", label="B Pair",
+                stake=unit, units=1.0,
+                ev=_ev_pair(live_pp) * unit,
+                reason="B " + pp_reason,
+            ))
+        remaining_cap -= unit
+
+    # ── Kelly criterion (fractional Kelly, 25%) ──────────────────────────── #
+    p_win = analysis.p_banker if main_side == "banker" else analysis.p_player
+    net_odds = 0.95 if main_side == "banker" else 1.0
+    q = 1.0 - p_win
+    raw_kelly = (net_odds * p_win - q) / net_odds
+    kelly_frac = max(0.0, raw_kelly)
+    kelly_stake_val = kelly_frac * 0.25 * (balance or 0.0)
 
     # ── Affordability ────────────────────────────────────────────────────── #
     total_stake = sum(l.stake for l in legs)
@@ -369,4 +438,7 @@ def compute_dynamic_spread(
         note=note,
         currency=currency,
         affordable=affordable,
+        pair_probs=pair_probs,
+        kelly_stake=kelly_stake_val,
+        kelly_fraction=kelly_frac,
     )

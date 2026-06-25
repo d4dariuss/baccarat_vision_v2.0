@@ -61,40 +61,8 @@ _DEBUG_MAX = 50
 
 def _snapshot_dict(controller: AppController) -> Dict[str, Any]:
     s = controller.snapshot()
-    p = s.prediction
     return {
-        "prediction": {
-            "p_banker": p.p_banker,
-            "p_player": p.p_player,
-            "p_tie": p.p_tie,
-            "confidence": p.confidence,
-            "lean": p.lean,
-            "predicting": p.predicting,
-            "composition_confidence": p.composition_confidence,
-        },
-        "shoe": {
-            "counts": s.shoe_counts,
-            "initial": s.shoe_initial,
-            "total_remaining": s.total_remaining,
-            "cards_dealt": s.cards_dealt,
-            "penetration": s.penetration,
-            "hands_played": s.hands_played,
-            "needs_reshuffle": s.needs_reshuffle,
-        },
-        "spread": {
-            "total_at_risk": s.spread.total_at_risk,
-            "expected_value": s.spread.expected_value,
-            "best_case": s.spread.best_case,
-            "worst_case": s.spread.worst_case,
-            "volatility": s.spread.volatility,
-            "rows": [
-                {"label": r.label, "probability": r.probability, "net": r.net,
-                 "is_best": r.is_best, "is_worst": r.is_worst}
-                for r in s.spread.rows
-            ],
-        },
-        "house_edges": s.house_edges,
-        "road_grid": s.road_grid,
+        "shoe": {"hands_played": s.hands_played},
         "mystic": None if s.mystic is None else {
             "pick": s.mystic.pick,
             "pick_label": s.mystic.pick_label,
@@ -151,6 +119,9 @@ def _snapshot_dict(controller: AppController) -> Dict[str, Any]:
         },
         "bankroll": s.bankroll,
         "vision": s.vision,
+        "vote_summary": s.vote_summary,
+        "template_match": s.template_match,
+        "calibration": s.calibration,
         "dynamic_spread": None if s.dynamic_spread is None else {
             "main_bet": s.dynamic_spread.main_bet,
             "main_label": s.dynamic_spread.main_label,
@@ -173,6 +144,9 @@ def _snapshot_dict(controller: AppController) -> Dict[str, Any]:
                 }
                 for l in s.dynamic_spread.legs
             ],
+            "pair_probs": s.dynamic_spread.pair_probs,
+            "kelly_stake": s.dynamic_spread.kelly_stake,
+            "kelly_fraction": s.dynamic_spread.kelly_fraction,
         },
     }
 

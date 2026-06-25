@@ -232,6 +232,14 @@
   let dumpedScoreboard = false;
   let prevBalance = null; // balance snapshot used to detect bet win/loss
 
+  // ─── Session followed-picks P/L ────────────────────────────────────────────
+  const session = {
+    betSignalledPick: null,  // pick name when prev snapshot had confident=true
+    followedPL: 0,           // cumulative P/L on BET-signalled hands
+    followedHands: 0,        // hands where BET was signalled
+    totalHands: 0,           // total new hands seen this session
+  };
+
   function dumpScoreboardOnce() {
     if (dumpedScoreboard) return;
     const sb = document.querySelector('[class*="scoreBoardInfo"]')
@@ -284,6 +292,7 @@
       // The casino counter reset -> a new shoe. The DOM counter is reliable
       // (unlike OCR), so archive the finished shoe to the library and start fresh.
       prevBalance = null; // discard stale reading so first hand of new shoe is clean
+      session.betSignalledPick = null; // reset BET arm on new shoe
       lastSnapshot = await api("/reset", "POST", { burn_cards: 10, hands: sum(cur) });
       counts = cur; lastHand = c.hand;
       setStatus(`new shoe at hand ${c.hand} — previous shoe archived`);
@@ -304,7 +313,7 @@
       return;
     }
 
-    // ── Win/lose sound via balance delta ─────────────────────────────────────
+    // ── Win/lose sound + session P/L via balance delta ───────────────────────
     // By the time the counter increments the casino has already paid out the
     // previous hand, so readBalance() here reflects the result.  A non-zero
     // change vs the saved pre-hand balance means the player had an active bet.
@@ -313,7 +322,13 @@
       const delta = balNow.balance - prevBalance.balance;
       if (delta > 0) playSound("win");
       else if (delta < 0) playSound("lose");
-      // delta === 0 → no bet placed (or exact push on Tie), no sound
+      // Track session P/L for BET-signalled hands
+      session.totalHands++;
+      if (session.betSignalledPick !== null) {
+        session.followedPL += delta;
+        session.followedHands++;
+        session.betSignalledPick = null;
+      }
     }
     prevBalance = balNow || prevBalance;
 
@@ -321,12 +336,21 @@
     const winners = [].concat(Array(dP).fill("P"), Array(dB).fill("B"), Array(dT).fill("T"));
     for (const w of winners) {
       const body = exact && exact.winner === w
-        ? exact
+        ? { winner: exact.winner, player_total: exact.player_total,
+            banker_total: exact.banker_total, is_natural: exact.is_natural,
+            p_pair: exact.p_pair, b_pair: exact.b_pair,
+            p_suited_pair: exact.p_suited_pair, b_suited_pair: exact.b_suited_pair,
+            card_values: exact.card_values }
         : { winner: w, player_total: 0, banker_total: 0 };
       lastSnapshot = await api("/hand", "POST", body);
     }
     counts = cur; lastHand = c.hand;
     render(lastSnapshot, exact, c);
+
+    // Arm session tracker: if THIS snapshot signals BET, record it for next tick.
+    session.betSignalledPick = (
+      lastSnapshot && lastSnapshot.mystic && lastSnapshot.mystic.confident
+    ) ? lastSnapshot.mystic.pick : null;
   }
 
   // ─── Sound effects ─────────────────────────────────────────────────────────
@@ -581,9 +605,10 @@
     const secPattern = makeSection("pattern", "📊", "Pattern",      true);
     const secModel   = makeSection("model",   "🧠", "AI Engine",    true);
     const secBalance = makeSection("balance", "🏦", "Balance",      true);
+    const secSession = makeSection("session", "📈", "Session",      true);
     const secHand    = makeSection("hand",    "🃏", "Last Hand",    false);
     const secBets    = makeSection("bets",    "📋", "All Bets",     false);
-    [secPick, secSpread, secPattern, secModel, secBalance, secHand, secBets]
+    [secPick, secSpread, secPattern, secModel, secBalance, secSession, secHand, secBets]
       .forEach((s) => body.appendChild(s));
 
     document.body.appendChild(panel);
@@ -592,6 +617,56 @@
   function setStatus(s) { ensurePanel(); if (statusEl) statusEl.textContent = s; }
 
   function $(id) { return panel ? panel.querySelector(`#bvsb-${id}`) : null; }
+
+  // ─── Render helpers ────────────────────────────────────────────────────────
+
+  function renderVoteSummary(vs) {
+    if (!vs || !vs.votes || !Object.keys(vs.votes).length) return "";
+    const total = Object.values(vs.votes).reduce((a, b) => a + b, 0) || 1;
+    const items = Object.entries(vs.votes)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([bet, w]) => {
+        const pct = (w / total * 100).toFixed(0);
+        const c = BET_COLOR[bet] || "#b0b8d8";
+        return `<span class="bv-chip"><span style="color:${c}">${BET_NAMES[bet] || bet}</span>` +
+               `<span style="color:#4a5070"> ${pct}%</span></span>`;
+      }).join("");
+    const dissent = (vs.top_dissent || []).slice(0, 2).join(", ");
+    return `<hr class="bv-divider">` +
+      `<div style="font-size:10px;color:#4a5070;margin-bottom:3px">Expert votes (${(vs.agreement * 100).toFixed(0)}% agree)</div>` +
+      `<div>${items}</div>` +
+      (dissent ? `<div class="bv-reason" style="margin-top:3px">Dissent: ${dissent}</div>` : "");
+  }
+
+  function renderCalibration(cal) {
+    if (!cal || !cal.length) return "";
+    const rows = cal.filter((c) => c.n >= 5);
+    if (rows.length < 2) return "";
+    const rowHtml = rows.map((c) => {
+      const diff = c.actual_rate - c.expected_rate;
+      const col = Math.abs(diff) < 0.05 ? "#00ff94" : Math.abs(diff) < 0.12 ? "#ffd700" : "#ff3d71";
+      return `<div class="bv-row">` +
+        `<span class="bv-lbl">${c.bin_label}</span>` +
+        `<span class="bv-val" style="color:${col}">${(c.actual_rate * 100).toFixed(0)}%` +
+        ` <span style="color:#4a5070;font-size:9px">vs ${(c.expected_rate * 100).toFixed(0)}% (n=${c.n})</span></span></div>`;
+    }).join("");
+    return `<hr class="bv-divider">` +
+      `<div style="font-size:10px;color:#4a5070;margin-bottom:3px">Calibration</div>` +
+      rowHtml;
+  }
+
+  function renderTemplateMatch(tm) {
+    if (!tm) return "";
+    const col = tm.pick === "B" ? "#ff3d71" : tm.pick === "P" ? "#00b4ff" : "#00ff94";
+    const name = tm.pick === "B" ? "Banker" : tm.pick === "P" ? "Player" : "Tie";
+    return `<hr class="bv-divider">` +
+      `<div class="bv-row" style="margin-top:2px">` +
+      `<span class="bv-lbl">Template match</span>` +
+      `<span class="bv-val" style="color:${col}">${name} (${(tm.confidence * 100).toFixed(0)}%)</span></div>` +
+      `<div class="bv-reason">From ${tm.n_matches} similar shoes · ` +
+      `B${(tm.b_pct * 100).toFixed(0)}% P${(tm.p_pct * 100).toFixed(0)}% T${(tm.t_pct * 100).toFixed(0)}%</div>`;
+  }
 
   // ─── Render ────────────────────────────────────────────────────────────────
   function render(data, hand, counter) {
@@ -717,6 +792,24 @@
           `<span class="bv-lbl">Total EV</span>` +
           `<span class="bv-val" style="color:${totalEvCol}">${ds.total_ev >= 0 ? "+" : ""}${fmtK(ds.total_ev)} ${cur}</span></div>`;
 
+        // Kelly optimal stake
+        if (ds.kelly_stake > 0) {
+          html += `<div class="bv-row" style="margin-top:3px">` +
+            `<span class="bv-lbl">Kelly optimal</span>` +
+            `<span class="bv-val" style="color:#c97bff">${fmtK(ds.kelly_stake)}${cur ? " " + cur : ""}` +
+            ` <span style="color:#4a5070;font-size:9px">(${(ds.kelly_fraction * 100).toFixed(2)}% bankroll)</span></span></div>`;
+        }
+        // Pair probability
+        if (ds.pair_probs && ds.pair_probs.either_pair != null) {
+          const ep = ds.pair_probs.either_pair;
+          const bep = ds.pair_probs.baseline_either_pair || 0.001;
+          const ratio = ep / bep;
+          const pairCol = ratio >= 1.08 ? "#ffd700" : "#4a5070";
+          html += `<div class="bv-row" style="margin-top:3px">` +
+            `<span class="bv-lbl" style="color:${pairCol}">Pair probability</span>` +
+            `<span class="bv-val" style="color:${pairCol}">${(ep * 100).toFixed(1)}%` +
+            ` <span style="color:#4a5070;font-size:9px">(${ratio >= 1 ? "+" : ""}${((ratio - 1) * 100).toFixed(0)}% vs base)</span></span></div>`;
+        }
         if (!ds.affordable) {
           html += `<div style="color:#ff9f00;font-size:10px;margin-top:3px">⚠ scaled to fit balance</div>`;
         }
@@ -779,7 +872,8 @@
         `<span class="bv-lbl">Last Tie / P / B</span>` +
         `<span class="bv-val">${since.T ?? "?"}h · ${since.P ?? "?"}h · ${since.B ?? "?"}h ago</span></div>` +
         (shoes ? `<div class="bv-row"><span class="bv-lbl">Shoe library</span>` +
-        `<span class="bv-val" style="color:#4a5070">${shoes} logged</span></div>` : "");
+        `<span class="bv-val" style="color:#4a5070">${shoes} logged</span></div>` : "") +
+        renderTemplateMatch(data.template_match);
     }
 
     // ── 🧠 AI Engine ─────────────────────────────────────────────────────── //
@@ -809,7 +903,9 @@
           `<span class="bv-lbl">Top expert</span>` +
           `<span class="bv-val" style="color:#c97bff;overflow:hidden;text-overflow:ellipsis;max-width:130px">${L.best_expert}</span></div>` +
           `<div style="margin-top:3px;font-size:10px;color:${vcol};overflow:hidden;` +
-          `text-overflow:ellipsis;white-space:nowrap">${L.verdict}</div>`;
+          `text-overflow:ellipsis;white-space:nowrap">${L.verdict}</div>` +
+          renderVoteSummary(data.vote_summary) +
+          renderCalibration(data.calibration);
       } else {
         modelEl.innerHTML = `<div style="color:#4a5070;font-size:11px">🔄 Collecting data — grading every hand…</div>`;
       }
@@ -837,6 +933,24 @@
       } else {
         balEl.innerHTML = `<div style="color:#ff9f00;font-size:11px">⚠ Balance not detected — open the table first</div>`;
       }
+    }
+
+    // ── 📈 Session ───────────────────────────────────────────────────────── //
+    const sessEl = $("session");
+    if (sessEl) {
+      const followed = session.followedHands;
+      const pl = session.followedPL;
+      const plCol = pl >= 0 ? "#00ff94" : "#ff3d71";
+      sessEl.innerHTML =
+        (followed > 0
+          ? `<div style="font-size:17px;font-weight:800;color:${plCol};margin-bottom:3px">` +
+            `${pl >= 0 ? "▲" : "▼"} ${fmtK(Math.abs(pl))}${cur ? " " + cur : ""}</div>` +
+            `<div class="bv-reason" style="margin-bottom:5px">on ${followed} BET-signalled hand${followed !== 1 ? "s" : ""}</div>`
+          : `<div class="bv-reason" style="margin-bottom:5px">No BET signals recorded yet</div>`) +
+        `<div class="bv-row"><span class="bv-lbl">Total new hands</span>` +
+        `<span class="bv-val">${session.totalHands}</span></div>` +
+        `<div class="bv-row"><span class="bv-lbl">BET signals followed</span>` +
+        `<span class="bv-val">${followed}</span></div>`;
     }
 
     // ── 🃏 Last Hand ─────────────────────────────────────────────────────── //
