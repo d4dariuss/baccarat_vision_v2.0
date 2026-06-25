@@ -29,14 +29,22 @@
   let assignedSlot = "A";
 
   // ----- engine API (via background relay; dodges https->localhost block) ----
+  // Returns true while the extension context is alive.
+  function _ctxOk() { try { return !!chrome.runtime?.id; } catch (_) { return false; } }
+
   function api(path, method = "GET", body = null) {
     // /probe selects the slot — don't inject a slot into that call itself.
     const slottedPath = path === "/probe" ? path : path + `?slot=${assignedSlot}`;
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: "api", path: slottedPath, method, body }, (resp) => {
-        if (chrome.runtime.lastError || !resp) return resolve(null);
-        resolve(resp.ok ? resp.data : null);
-      });
+      if (!_ctxOk()) { resolve(null); return; }
+      try {
+        chrome.runtime.sendMessage({ type: "api", path: slottedPath, method, body }, (resp) => {
+          try {
+            if (chrome.runtime.lastError || !resp) return resolve(null);
+            resolve(resp.ok ? resp.data : null);
+          } catch (_) { resolve(null); }
+        });
+      } catch (_) { resolve(null); }
     });
   }
 
@@ -114,8 +122,12 @@
   }
   function getRelayedBalance() {
     return new Promise((r) => {
-      try { chrome.runtime.sendMessage({ type: "getBalance" }, (resp) => r(resp && resp.ok ? resp.data : null)); }
-      catch (e) { r(null); }
+      if (!_ctxOk()) { r(null); return; }
+      try {
+        chrome.runtime.sendMessage({ type: "getBalance" }, (resp) => {
+          try { r(resp && resp.ok ? resp.data : null); } catch (_) { r(null); }
+        });
+      } catch (_) { r(null); }
     });
   }
   let lastCtx = "";
@@ -234,14 +246,115 @@
   // Last non-null counter snapshot — captured synchronously in the MutationObserver
   // callback so the 250 ms debounce can't drop it before tick() runs.
   let _savedCounter = null;
+  // Fingerprint of the last hand we posted to /hand — used to avoid double-posting
+  // the final hand of a shoe when the counter doesn't update for it (Iconic21 bug).
+  let _lastHandFingerprint = null;
 
   // ─── Session followed-picks P/L ────────────────────────────────────────────
   const session = {
-    betSignalledPick: null,  // pick name when prev snapshot had confident=true
-    followedPL: 0,           // cumulative P/L on BET-signalled hands
-    followedHands: 0,        // hands where BET was signalled
-    totalHands: 0,           // total new hands seen this session
+    betSignalledPick: null,
+    followedPL: 0,
+    followedHands: 0,
+    totalHands: 0,
+    wins: 0,
+    losses: 0,
   };
+
+  // Per-shoe session history — persisted across page refreshes via chrome.storage
+  let _shoeHistory = [];  // [{shoe, wins, losses, pl, hands, ts}]
+  let _shoeNum = 0;       // incremented on each new shoe
+  const _SESS_KEY = "bv_session_v1";
+  const _SESS_TTL = 8 * 3600 * 1000; // 8 hours — discard stale data from prior day
+
+  function _saveSession() {
+    if (!_ctxOk()) return;
+    try {
+      chrome.storage.local.set({ [_SESS_KEY]: {
+        shoeHistory: _shoeHistory,
+        shoeNum: _shoeNum,
+        current: { wins: session.wins, losses: session.losses,
+                   followedPL: session.followedPL, followedHands: session.followedHands },
+        ts: Date.now(),
+      }});
+    } catch (_) {}
+  }
+
+  function _loadSession() {
+    if (!_ctxOk()) return;
+    try {
+      chrome.storage.local.get(_SESS_KEY, (data) => {
+        const d = data && data[_SESS_KEY];
+        if (!d || !d.ts || Date.now() - d.ts > _SESS_TTL) return;
+        _shoeHistory = d.shoeHistory || [];
+        _shoeNum = d.shoeNum || 0;
+        if (d.current) {
+          session.wins = d.current.wins || 0;
+          session.losses = d.current.losses || 0;
+          session.followedPL = d.current.followedPL || 0;
+          session.followedHands = d.current.followedHands || 0;
+        }
+      });
+    } catch (_) {}
+  }
+
+  function _archiveCurrentShoe() {
+    if (session.wins + session.losses > 0 || session.followedHands > 0) {
+      _shoeHistory.push({
+        shoe: _shoeNum,
+        wins: session.wins, losses: session.losses,
+        pl: session.followedPL, hands: session.followedHands,
+        ts: Date.now(),
+      });
+      // Keep only last 20 shoes to cap storage size
+      if (_shoeHistory.length > 20) _shoeHistory.shift();
+    }
+    _shoeNum++;
+    session.wins = 0; session.losses = 0;
+    session.followedPL = 0; session.followedHands = 0;
+    _saveSession();
+  }
+
+  // Read actual bets placed on the table from the game DOM (best-effort)
+  function readPlacedBets() {
+    const bets = {};
+    // Try data-locator attribute patterns used by Spinquest/Iconic21
+    const tryLocator = (key, ...locs) => {
+      for (const loc of locs) {
+        const el = document.querySelector(`[data-locator="${loc}"]`)
+          || document.querySelector(`[data-locator*="${loc}"]`);
+        if (!el) continue;
+        const amt = parseAmount(el.textContent);
+        if (amt > 0) { bets[key] = amt; return; }
+      }
+    };
+    tryLocator("banker",      "gameline", "banker", "main-bet", "gameline-bet");
+    tryLocator("player",      "player", "player-bet");
+    tryLocator("tie",         "tie", "tie-bet");
+    tryLocator("super_6",     "super6", "super-6", "superhot6");
+    tryLocator("b_bonus",     "bbonus", "b-bonus", "banker-bonus");
+    tryLocator("p_bonus",     "pbonus", "p-bonus", "player-bonus");
+    tryLocator("either_pair", "either-pair", "anypair", "pair");
+
+    // Fallback: class-based bet amount elements
+    if (!Object.keys(bets).length) {
+      for (const el of document.querySelectorAll(
+          '[class*="betAmount"],[class*="bet-amount"],[class*="totalBet"],[class*="wager__amount"]')) {
+        const amt = parseAmount(el.textContent);
+        if (!amt) continue;
+        const anc = el.closest('[data-locator]') || el.closest('[data-bet]');
+        if (!anc) continue;
+        const hint = (anc.getAttribute('data-locator') || anc.getAttribute('data-bet') || '').toLowerCase();
+        if (hint.includes('banker') || hint.includes('gameline')) bets.banker = (bets.banker || 0) + amt;
+        else if (hint.includes('player')) bets.player = (bets.player || 0) + amt;
+        else if (hint.includes('tie')) bets.tie = (bets.tie || 0) + amt;
+        else if (hint.includes('super6') || hint.includes('super-6')) bets.super_6 = (bets.super_6 || 0) + amt;
+        else if (hint.includes('bonus') && (hint.includes('b') || hint.includes('banker'))) bets.b_bonus = (bets.b_bonus || 0) + amt;
+        else if (hint.includes('bonus')) bets.p_bonus = (bets.p_bonus || 0) + amt;
+        else if (hint.includes('pair')) bets.either_pair = (bets.either_pair || 0) + amt;
+      }
+    }
+    return Object.keys(bets).length ? bets : null;
+  }
 
   function dumpScoreboardOnce() {
     if (dumpedScoreboard) return;
@@ -250,8 +363,33 @@
     if (sb) { dumpedScoreboard = true; api("/debug-card", "POST", { html: "SCOREBOARD:\n" + sb.outerHTML }); }
   }
 
+  // One-time dump of bet areas so we can identify DOM selectors for readPlacedBets()
+  let _dumpedBetArea = false;
+  function dumpBetAreaOnce() {
+    if (_dumpedBetArea) return;
+    // Try to find any element containing bet amounts
+    const candidates = [
+      document.querySelector('[class*="bettingArea"],[class*="betArea"],[class*="gameLine"],[class*="game-line"]'),
+      document.querySelector('[class*="chipTray"],[class*="chip-tray"],[class*="betPanel"]'),
+      document.querySelector('[class*="totalBet"],[class*="total-bet"],[class*="wager"]'),
+      document.querySelector('[data-locator*="gameline"],[data-locator*="bet"]'),
+    ].filter(Boolean);
+    if (candidates.length) {
+      _dumpedBetArea = true;
+      const html = candidates.map(el => `[${el.className||el.getAttribute('data-locator')}]:\n${el.outerHTML.slice(0, 800)}`).join("\n\n");
+      api("/debug-card", "POST", { html: "BET_AREA:\n" + html });
+    }
+  }
+
   let sawGame = false;
+  let _tickRunning = false; // prevents observer + interval from double-counting the same hand
   async function tick() {
+    if (_tickRunning) return;
+    if (!_ctxOk()) return; // Extension reloaded — stop silently
+    _tickRunning = true;
+    try { await _tick(); } finally { _tickRunning = false; }
+  }
+  async function _tick() {
     const liveC = readCounter();
     // Keep _savedCounter in sync so the observer value never lags a full interval.
     if (liveC) _savedCounter = liveC;
@@ -264,6 +402,7 @@
     pushContext();         // keep the server's balance/chips fresh
     if (!c) { setStatus("looking for the counter…"); return; }
     dumpScoreboardOnce();
+    dumpBetAreaOnce();
     const cur = [c.P, c.B, c.T];
     const sum = (a) => a[0] + a[1] + a[2];
 
@@ -283,12 +422,14 @@
           lastSnapshot = await api("/snapshot");
           setStatus(`resumed slot ${assignedSlot} at hand ${c.hand}`);
         } else {
-          // New shoe (or fresh slot) — full reset.
+          // New shoe (or fresh slot) — archive any prior shoe data, then full reset.
+          _archiveCurrentShoe();
           lastSnapshot = await api("/reset", "POST", { burn_cards: 10, hands: sum(cur) });
           setStatus(`slot ${assignedSlot} — new shoe at hand ${c.hand}`);
         }
       } else {
-        // Server offline or probe failed — fall back to a plain reset.
+        // Server offline or probe failed — archive prior data and reset.
+        _archiveCurrentShoe();
         lastSnapshot = await api("/reset", "POST", { burn_cards: 10, hands: sum(cur) });
         setStatus(`synced at hand ${c.hand}`);
       }
@@ -297,10 +438,33 @@
       return;
     }
     if (sum(cur) < sum(counts) || c.hand < lastHand) {
-      // The casino counter reset -> a new shoe. The DOM counter is reliable
-      // (unlike OCR), so archive the finished shoe to the library and start fresh.
+      // The casino counter reset -> a new shoe.
+      // Iconic21 does NOT update the road totals for the final hand of a shoe.
+      // The cards are still visible on the table when this fires, so try to
+      // capture and post that missed hand before archiving the old shoe.
+      const lastHandCards = readHand();
+      if (lastHandCards) {
+        const fp = `${lastHandCards.winner}${lastHandCards.player_total}${lastHandCards.banker_total}`;
+        if (fp !== _lastHandFingerprint) {
+          // This hand wasn't posted yet — post it now before the reset.
+          await api("/hand", "POST", {
+            winner: lastHandCards.winner,
+            player_total: lastHandCards.player_total,
+            banker_total: lastHandCards.banker_total,
+            is_natural: lastHandCards.is_natural,
+            p_pair: lastHandCards.p_pair,
+            b_pair: lastHandCards.b_pair,
+            p_suited_pair: lastHandCards.p_suited_pair,
+            b_suited_pair: lastHandCards.b_suited_pair,
+            card_values: lastHandCards.card_values,
+          });
+          _lastHandFingerprint = fp;
+        }
+      }
       prevBalance = null; // discard stale reading so first hand of new shoe is clean
       session.betSignalledPick = null; // reset BET arm on new shoe
+      _lastHandFingerprint = null; // reset fingerprint for new shoe
+      _archiveCurrentShoe(); // persist shoe stats before reset
       lastSnapshot = await api("/reset", "POST", { burn_cards: 10, hands: sum(cur) });
       counts = cur; lastHand = c.hand;
       setStatus(`new shoe at hand ${c.hand} — previous shoe archived`);
@@ -335,7 +499,21 @@
       if (session.betSignalledPick !== null) {
         session.followedPL += delta;
         session.followedHands++;
+        // Fire edge flash + win/loss count here (balance-detected path).
+        // render() checks betSignalledPick too but it will be null by then,
+        // so that block acts as fallback only when balance is undetectable.
+        if (delta > 0) {
+          session.wins++;
+          edgeFlash("win");
+        } else if (delta < 0) {
+          session.losses++;
+          edgeFlash("lose");
+        }
+        // Still set flag so render() skips the "no-bet" subtle prediction ping
+        _lastHandBetFollowed = true;
+        _lastHandBetWon = delta > 0;
         session.betSignalledPick = null;
+        _saveSession(); // persist after each bet outcome
       }
     }
     prevBalance = balNow || prevBalance;
@@ -352,6 +530,8 @@
         : { winner: w, player_total: 0, banker_total: 0 };
       lastSnapshot = await api("/hand", "POST", body);
     }
+    // Track fingerprint so the shoe-end rescue doesn't double-post this hand.
+    if (exact) _lastHandFingerprint = `${exact.winner}${exact.player_total}${exact.banker_total}`;
     counts = cur; lastHand = c.hand;
     render(lastSnapshot, exact, c);
 
@@ -444,14 +624,14 @@
   }
 
   const BET_COLOR = {
-    banker: "#ff3d71", player: "#00b4ff", tie: "#00ff94",
-    super_6: "#c97bff", b_bonus: "#ff9f00", p_bonus: "#ff9f00",
-    either_pair: "#ffd700", player_pair: "#ff69b4", banker_pair: "#ff69b4",
-    suited_pair: "#ff69b4",
+    banker: "#ff453a", player: "#0a84ff", tie: "#30d158",
+    super_6: "#bf5af2", b_bonus: "#ff9f0a", p_bonus: "#ff9f0a",
+    either_pair: "#ffd60a", player_pair: "#ff375f", banker_pair: "#ff375f",
+    suited_pair: "#ff375f",
   };
   // Colored dot representing a bet type — uses BET_COLOR so defined after it.
   function betDot(bet) {
-    const c = BET_COLOR[bet] || "#b0b8d8";
+    const c = BET_COLOR[bet] || "rgba(235,235,245,0.4)";
     return `<svg width="7" height="7" viewBox="0 0 8 8" style="display:inline-block;vertical-align:middle;flex-shrink:0;margin-right:3px"><circle cx="4" cy="4" r="4" fill="${c}"/></svg>`;
   }
   const BET_NAMES = {
@@ -461,43 +641,66 @@
   };
 
   function pnl(x, dec = 1) {
-    const c = x >= 0 ? "#00ff94" : "#ff3d71";
-    return `<span style="color:${c};font-weight:600">${x >= 0 ? "+" : ""}${x.toFixed(dec)}</span>`;
+    const c = x >= 0 ? "#30d158" : "#ff453a";
+    return `<span style="color:${c};font-weight:500">${x >= 0 ? "+" : ""}${x.toFixed(dec)}</span>`;
   }
   function pnlFmt(x) {
-    const c = x >= 0 ? "#00ff94" : "#ff3d71";
-    return `<span style="color:${c};font-weight:600">${x >= 0 ? "+" : "-"}${fmtK(Math.abs(x))}</span>`;
+    const c = x >= 0 ? "#30d158" : "#ff453a";
+    return `<span style="color:${c};font-weight:500">${x >= 0 ? "+" : "-"}${fmtK(Math.abs(x))}</span>`;
   }
   function bar(pct, color, h = 3) {
     const w = Math.max(0, Math.min(100, pct * 100)).toFixed(1);
-    return `<div style="height:${h}px;background:#1a1a35;border-radius:2px;overflow:hidden;margin:2px 0">` +
+    return `<div style="height:${h}px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;margin:3px 0">` +
            `<div class="bv-bar-fill" style="width:${w}%;height:100%;background:${color};border-radius:2px;` +
-           `box-shadow:0 0 6px ${color}80;transition:width .3s"></div></div>`;
+           `transition:width .35s ease"></div></div>`;
   }
 
   const SUIT_DISP = { s: "♠", h: "♥", d: "♦", c: "♣" };
   function cardHtml(c) {
     const red = c.suit === "h" || c.suit === "d";
-    const col = red ? "#ff6b6b" : "#c0c8e0";
-    return `<span style="display:inline-block;background:#12122e;border:1px solid #2a2a55;border-radius:3px;` +
-           `padding:1px 5px;margin:0 1px;font-size:11px;font-family:monospace;color:${col}">` +
+    const col = red ? "#ff453a" : "rgba(235,235,245,0.82)";
+    return `<span style="display:inline-block;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.13);border-radius:5px;` +
+           `padding:2px 7px;margin:0 2px;font-size:13px;font-family:'JetBrains Mono',monospace;font-weight:600;color:${col}">` +
            `${c.rank}${SUIT_DISP[c.suit] || ""}</span>`;
   }
 
   // ─── Animation helpers ─────────────────────────────────────────────────────
 
-  function pingOrb(wrapEl) {
+  function pingOrb(wrapEl, count = 2, color = null) {
     if (!wrapEl) return;
-    const orbEl = wrapEl.querySelector(".bv-orb");
-    for (let i = 0; i < 2; i++) {
+    const col = color || wrapEl.dataset.col || "#0a84ff";
+    for (let i = 0; i < count; i++) {
       setTimeout(() => {
+        // Re-query the ring in case innerHTML was replaced between ticks
+        const target = wrapEl.isConnected ? wrapEl
+          : (panel && panel.querySelector("#bv-pick-ring"));
+        if (!target) return;
         const r = document.createElement("div");
         r.className = "bv-ring";
-        r.style.color = orbEl ? orbEl.style.color : "#00e5ff";
-        wrapEl.appendChild(r);
-        setTimeout(() => r.remove(), 960);
-      }, i * 230);
+        r.style.color = col;
+        target.appendChild(r);
+        setTimeout(() => r.remove(), 750);
+      }, i * 180);
     }
+  }
+
+  function subtlePing(wrapEl, col = "rgba(48,209,88,0.35)") {
+    if (!wrapEl) return;
+    // Re-query in case the ring was replaced
+    const target = wrapEl.isConnected ? wrapEl
+      : (panel && panel.querySelector("#bv-pick-ring"));
+    if (!target) return;
+    const r = document.createElement("div");
+    r.className = "bv-ring";
+    r.style.color = col;
+    r.style.opacity = "0.45";
+    target.appendChild(r);
+    setTimeout(() => r.remove(), 750);
+  }
+
+  function pickRingPing(col, count) {
+    const ring = panel && panel.querySelector("#bv-pick-ring");
+    if (ring) pingOrb(ring, count, col);
   }
 
   function edgeFlash(type) {
@@ -505,7 +708,7 @@
     panel.classList.remove("bv-flash-win", "bv-flash-lose");
     void panel.offsetWidth;
     panel.classList.add(type === "win" ? "bv-flash-win" : "bv-flash-lose");
-    setTimeout(() => panel && panel.classList.remove("bv-flash-win", "bv-flash-lose"), 850);
+    setTimeout(() => panel && panel.classList.remove("bv-flash-win", "bv-flash-lose"), 750);
   }
 
   function scanNewShoe() {
@@ -528,19 +731,20 @@
     el.style.left = Math.round(r.left + r.width / 2 - 28) + "px";
     el.style.top  = Math.round(r.top - 4) + "px";
     document.body.appendChild(el);
-    setTimeout(() => el.remove(), 1200);
+    setTimeout(() => el.remove(), 1100);
   }
 
   function sweepSection(id) {
     if (!panel) return;
-    const hdr = panel.querySelector(`[data-id="${id}"]`);
-    if (!hdr) return;
+    // Works on both old header elements [data-id] and new zone elements [#bvsb-*]
+    const el = panel.querySelector(`[data-id="${id}"]`) || panel.querySelector(`#bvsb-${id}`);
+    if (!el) return;
     const sw = document.createElement("div");
     sw.className = "bv-sweep";
-    hdr.style.position = "relative";
-    hdr.style.overflow = "hidden";
-    hdr.appendChild(sw);
-    setTimeout(() => { sw.remove(); hdr.style.overflow = ""; }, 650);
+    if (window.getComputedStyle(el).position === "static") el.style.position = "relative";
+    el.style.overflow = "hidden";
+    el.appendChild(sw);
+    setTimeout(() => { sw.remove(); el.style.overflow = ""; }, 600);
   }
 
   function arcSvg(pct) {
@@ -556,28 +760,68 @@
 
   // ─── Section factory ───────────────────────────────────────────────────────
   // Sections survive panel recreation — store open/closed state by id.
+  // Section open/close state — persisted so reloads remember user's choices.
+  const _SECSTATE_KEY = "bv_secstate_v1";
   const _sectionState = {};
-  function makeSection(id, iconName, title, defaultOpen = true) {
+  let _secStateLoaded = false;
+
+  function _saveSectionState() {
+    if (!_ctxOk()) return;
+    try { chrome.storage.local.set({ [_SECSTATE_KEY]: _sectionState }); } catch (_) {}
+  }
+
+  function _loadSectionState(cb) {
+    if (!_ctxOk()) { cb(); return; }
+    try {
+      chrome.storage.local.get(_SECSTATE_KEY, (d) => {
+        if (d && d[_SECSTATE_KEY]) Object.assign(_sectionState, d[_SECSTATE_KEY]);
+        _secStateLoaded = true;
+        cb();
+      });
+    } catch (_) { _secStateLoaded = true; cb(); }
+  }
+
+  // _secHide / _secShow: use inline setProperty AND a watchdog so even game JS
+  // that calls element.style.display = 'block' gets immediately reversed.
+  function _secHide(body) {
+    body.classList.add("bv-hidden");
+    body.style.setProperty("display", "none", "important");
+    // Watchdog: game JS can overwrite setProperty; MO fires and re-hides.
+    if (!body._bvWatcher) {
+      body._bvWatcher = new MutationObserver(() => {
+        if (body.classList.contains("bv-hidden") && body.style.display !== "none") {
+          body.style.setProperty("display", "none", "important");
+        }
+      });
+      body._bvWatcher.observe(body, { attributes: true, attributeFilter: ["style"] });
+    }
+  }
+  function _secShow(body) {
+    if (body._bvWatcher) { body._bvWatcher.disconnect(); body._bvWatcher = null; }
+    body.classList.remove("bv-hidden");
+    body.style.removeProperty("display");
+  }
+
+  function makeSection(id, title, defaultOpen = true) {
     const open = _sectionState[id] !== undefined ? _sectionState[id] : defaultOpen;
     const sec = document.createElement("div");
+    sec.className = "bv-section";
     sec.innerHTML =
       `<div class="bvsh" data-id="${id}">` +
-      `<span style="display:inline-flex;align-items:center;gap:5px;font-family:'Cinzel','Palatino Linotype',serif;` +
-      `font-size:9.5px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#5a6080">` +
-      `${icon(iconName, 11, "#5a6080")}${title}</span>` +
-      `<span class="bvchev" style="color:#3a3a60;font-size:9px">${open ? "▼" : "▶"}</span></div>` +
-      `<div class="bvsb" id="bvsb-${id}" style="display:${open ? "block" : "none"}"></div>`;
+        `<span class="bvsh-label">${title}</span>` +
+        `<span id="bvsecv-${id}" class="bvsh-value"></span>` +
+        `<span class="bvchev" style="transform:rotate(${open ? 90 : 0}deg)">›</span>` +
+      `</div>` +
+      `<div class="bvsb" id="bvsb-${id}"></div>`;
+    const body = sec.querySelector(".bvsb");
+    if (!open) _secHide(body);
     sec.querySelector(".bvsh").addEventListener("click", () => {
-      const body = sec.querySelector(".bvsb");
       const chev = sec.querySelector(".bvchev");
-      const nowOpen = body.style.display !== "none";
-      body.style.display = nowOpen ? "none" : "block";
-      chev.textContent = nowOpen ? "▶" : "▼";
-      chev.classList.remove("bv-chev-open", "bv-chev-close");
-      void chev.offsetWidth;
-      chev.classList.add(nowOpen ? "bv-chev-close" : "bv-chev-open");
-      setTimeout(() => chev.classList.remove("bv-chev-open", "bv-chev-close"), 380);
+      const nowOpen = !body.classList.contains("bv-hidden");
+      nowOpen ? _secHide(body) : _secShow(body);
+      chev.style.transform = `rotate(${nowOpen ? 0 : 90}deg)`;
       _sectionState[id] = !nowOpen;
+      _saveSectionState();
     });
     return sec;
   }
@@ -586,192 +830,261 @@
   let panel = null, statusEl = null, _minimised = false;
 
   // ── Animation state ────────────────────────────────────────────────────────
-  let _prevConfident   = false;  // BET on/off — drives burst + title widen
-  let _prevBalanceAnim = null;   // last rendered balance — drives delta float
-  let _prevDragon      = false;  // dragon onset — drives shake
-  let _prevHandNum     = 0;      // detects new shoe for scan wipe
-  let _sectionInited   = {};     // tracks first-data sweep per section
-  let _handHistory     = [];     // last 14 P/B/T outcomes for bead row
+  let _prevConfident       = false;  // BET on/off — drives burst + title widen
+  let _prevBalanceAnim     = null;   // last rendered balance — drives delta float
+  let _prevDragon          = false;  // dragon onset — drives shake
+  let _prevHandNum         = 0;      // detects new shoe for scan wipe
+  let _prevHandWinner      = null;   // last rendered hand winner — detects new hand in render
+  let _lastHandBetFollowed = false;  // set in tick when a bet-following hand resolves
+  let _lastHandBetWon      = false;  // outcome of that followed-bet hand
+  let _sectionInited       = {};     // tracks first-data sweep per section
+  let _handHistory         = [];     // last 14 P/B/T outcomes for bead row
 
   function injectCSS() {
     if (document.getElementById("bv-css")) return;
     const s = document.createElement("style");
     s.id = "bv-css";
-    // @import must be the first rule in the stylesheet.
-    s.textContent = `@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&display=swap');
+    s.textContent = `@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
-      #bv-panel{position:fixed;top:12px;right:12px;width:284px;max-height:calc(100vh - 24px);
-        overflow-y:auto;overflow-x:hidden;background:#07071a;
-        border:1px solid #00e5ff22;border-radius:14px;
-        font-family:'Segoe UI',system-ui,sans-serif;font-size:12px;color:#b0b8d8;
-        z-index:2147483647;box-shadow:0 0 32px #00e5ff10,0 12px 40px #00000099;
+      /* ── Panel shell ──────────────────────────────────────────────────── */
+      #bv-panel{position:fixed;top:12px;right:12px;width:280px;
+        max-height:calc(100vh - 24px);overflow-y:auto;overflow-x:hidden;
+        background:#1c1c1e !important;
+        border:1px solid rgba(255,255,255,0.1);border-radius:16px;
+        font-family:"Inter",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+        font-size:12px;color:rgba(235,235,245,0.6);
+        z-index:2147483647;
+        transform:translateZ(0);will-change:transform;isolation:isolate;
+        contain:paint;
+        box-shadow:0 24px 60px rgba(0,0,0,0.65),0 0 0 0.5px rgba(255,255,255,0.04);
         box-sizing:border-box;pointer-events:auto !important;}
-      #bv-panel *{box-sizing:border-box;max-width:100%}
+      /* Prevent game CSS making any panel child transparent */
+      #bv-panel *{box-sizing:border-box;max-width:100%;background-color:transparent}
+      /* Section bodies that are explicit containers need opaque bg */
+      #bv-panel .bvsb,#bv-panel #bv-body{background:#1c1c1e !important}
+      /* Reset game-level table/div styles that can bleed in */
+      #bv-panel table{border-collapse:collapse;border-spacing:0;border:none}
+      #bv-panel td,#bv-panel th{border:none}
       #bv-panel::-webkit-scrollbar{width:3px}
-      #bv-panel::-webkit-scrollbar-track{background:#07071a}
-      #bv-panel::-webkit-scrollbar-thumb{background:#1e1e40;border-radius:2px}
-      #bv-hdr{position:sticky;top:0;z-index:1;padding:11px 14px 9px;
-        background:#05051a;border-radius:14px 14px 0 0;
-        border-bottom:1px solid #0f0f28;cursor:grab;text-align:center}
-      #bv-hdr:active{cursor:grabbing}
-      .bv-logo{font-family:'Cinzel','Palatino Linotype','Palatino',serif;
-        font-weight:700;font-size:13px;letter-spacing:3px;
-        color:#00e5ff;text-shadow:0 0 14px #00e5ff50;line-height:1.2;
-        white-space:nowrap}
-      #bv-status{font-size:9px;color:#3a3a60;letter-spacing:.3px;margin-top:2px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      #bv-min{position:absolute;right:10px;top:50%;transform:translateY(-50%);
-        background:none;border:none;color:#3a3a60;cursor:pointer;
-        font-size:15px;line-height:1;padding:4px;flex-shrink:0}
-      #bv-min:hover{color:#5a5a80}
+      #bv-panel::-webkit-scrollbar-track{background:transparent}
+      #bv-panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.12);border-radius:2px}
 
-      /* Orb — uses filter:drop-shadow so the circular glow is never square-clipped
-         by overflow:hidden on ancestors. box-shadow would be clipped; this is not. */
-      .bv-orb{width:62px;height:62px;border-radius:50%;
-        display:flex;align-items:center;justify-content:center;
-        font-family:'Cinzel','Palatino Linotype',serif;
-        font-size:22px;font-weight:700;flex-shrink:0;
-        transition:filter .5s,background .5s,border-color .5s}
+      /* ── Header ───────────────────────────────────────────────────────── */
+      #bv-hdr{position:sticky;top:0;z-index:1;
+        display:flex;align-items:center;gap:8px;padding:11px 14px;
+        background:#1c1c1e;
+        border-bottom:1px solid rgba(255,255,255,0.06);border-radius:15px 15px 0 0;}
+      #bv-grip{color:rgba(235,235,245,0.2);font-size:15px;line-height:1;
+        cursor:grab;flex-shrink:0;user-select:none;letter-spacing:-0.5px}
+      #bv-grip:active{cursor:grabbing}
+      #bv-wordmark-wrap{flex:1;display:flex;flex-direction:column;gap:0;min-width:0}
+      #bv-wordmark{font-size:11px;font-weight:600;letter-spacing:0.04em;
+        color:rgba(235,235,245,0.85);white-space:nowrap}
+      #bv-status{font-size:9px;color:rgba(235,235,245,0.2);white-space:nowrap;
+        overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+      #bv-live-wrap{display:flex;align-items:center;gap:5px;flex-shrink:0}
+      #bv-live-dot{width:6px;height:6px;border-radius:50%;background:#30d158;
+        box-shadow:0 0 0 2px rgba(48,209,88,0.2);flex-shrink:0}
+      #bv-live-label{font-size:10px;font-weight:500;letter-spacing:0.06em;
+        color:rgba(235,235,245,0.3)}
+      #bv-min{background:none;border:none;color:rgba(235,235,245,0.25);cursor:pointer;
+        font-size:17px;line-height:1;padding:2px 0 2px 6px;flex-shrink:0}
+      #bv-min:hover{color:rgba(235,235,245,0.6)}
+      #bv-shoe-bar-track{position:absolute;left:0;right:0;bottom:0;height:1.5px;
+        background:rgba(255,255,255,0.05)}
+      #bv-shoe-bar-fill{height:100%;
+        background:linear-gradient(90deg,#0a84ff 0%,#30d158 100%);
+        border-radius:0 1px 1px 0;transition:width 0.5s ease;width:0}
 
-      /* Section headers */
-      .bvsh{display:flex;align-items:center;justify-content:space-between;
-        padding:7px 12px;cursor:pointer;background:#09091f;user-select:none;
-        border-top:1px solid #0f0f28}
-      .bvsh:hover{background:#0c0c24}
-      .bvsb{padding:10px 12px}
+      /* ── Collapsible sections ─────────────────────────────────────────── */
+      .bv-section{border-bottom:1px solid rgba(255,255,255,0.06)}
+      .bvsh{display:flex;align-items:center;padding:11px 16px;cursor:pointer;
+        user-select:none;transition:background 0.15s ease;gap:6px}
+      .bvsh:hover{background:rgba(255,255,255,0.03)}
+      .bvsh-label{font-size:10px;font-weight:700;letter-spacing:0.08em;
+        color:rgba(235,235,245,0.48);text-transform:uppercase;flex-shrink:0}
+      .bvsh-value{font-family:"JetBrains Mono",monospace;font-size:11px;
+        font-weight:600;color:rgba(235,235,245,0.55);flex:1;min-width:0;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:0;
+        padding-left:6px}
+      .bvchev{font-size:13px;color:rgba(235,235,245,0.25);
+        transition:transform 0.22s ease;display:inline-block;flex-shrink:0;margin-left:auto}
+      .bvsb{display:block;padding:10px 16px 14px}
+      #bv-panel .bvsb.bv-hidden{display:none !important;padding:0;margin:0;height:0;overflow:hidden}
+      #bv-panel #bv-body.bv-hidden{display:none !important}
+      #bvsb-session{padding:0}
 
+      /* ── Pick zone ────────────────────────────────────────────────────── */
+      #bv-pick-name{font-size:30px;font-weight:700;letter-spacing:-0.025em;
+        color:#ffffff;line-height:1;margin-bottom:5px;transition:color 0.3s ease}
+      #bv-confidence-num{font-family:"JetBrains Mono",monospace;
+        transition:color 0.3s ease}
+      #bv-pick-stake{font-family:"JetBrains Mono",monospace;
+        font-size:18px;font-weight:600;color:rgba(235,235,245,0.85);
+        transition:color 0.3s ease;text-align:right}
+      /* Anchor for radar-ring animation on new hand */
+      #bv-pick-ring{position:relative;width:40px;height:40px;
+        border-radius:50%;flex-shrink:0}
+
+      /* ── Badges ───────────────────────────────────────────────────────── */
+      .bv-badge{display:inline-flex;align-items:center;gap:4px;
+        font-size:10px;font-weight:600;letter-spacing:0.04em;
+        padding:3px 9px;border-radius:6px}
+      .bv-badge-bet{border:1px solid transparent}
+      .bv-badge-opt{background:rgba(235,235,245,0.06);color:rgba(235,235,245,0.3);
+        border:1px solid rgba(235,235,245,0.1)}
+
+      /* ── Allocation zone ──────────────────────────────────────────────── */
+      #bvsb-spread{transition:opacity 0.3s ease;padding-top:2px}
+      #bvsb-spread.bv-locked{opacity:0.38}
+      .bv-leg-row{display:flex;align-items:center;
+        padding:6px 0 6px 12px;
+        border-left:3px solid transparent;min-width:0;gap:8px;
+        border-radius:0 4px 4px 0}
+      .bv-leg-name{font-size:11px;font-weight:600;color:rgba(235,235,245,0.9);
+        flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .bv-leg-amt{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:500;
+        color:rgba(235,235,245,0.85);white-space:nowrap;flex-shrink:0}
+      .bv-leg-ev{font-family:"JetBrains Mono",monospace;font-size:9px;
+        white-space:nowrap;flex-shrink:0;opacity:0.6}
+      #bv-kelly-track{height:2px;background:rgba(255,255,255,0.07);
+        border-radius:1px;overflow:hidden;margin-top:10px}
+      #bv-kelly-fill{height:100%;border-radius:1px;
+        transition:width 0.4s ease,background 0.4s ease}
+
+      /* ── Session strip ────────────────────────────────────────────────── */
+      .bv-session-grid{display:grid;grid-template-columns:1fr 1fr;gap:0}
+      .bv-session-cell{padding:10px 16px}
+      .bv-session-cell + .bv-session-cell{text-align:right}
+      .bv-micro-lbl{font-size:9px;font-weight:600;letter-spacing:0.08em;
+        color:rgba(235,235,245,0.2);text-transform:uppercase;margin-bottom:3px}
+      #bv-session-pl{font-family:"JetBrains Mono",monospace;
+        font-size:16px;font-weight:600;line-height:1;transition:color 0.3s ease}
+      #bv-session-meta{font-size:10px;color:rgba(235,235,245,0.3);margin-top:4px;
+        display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+      #bv-balance-num{font-family:"JetBrains Mono",monospace;
+        font-size:19px;font-weight:700;color:rgba(235,235,245,0.92);line-height:1}
+      #bv-balance-meta{font-size:10px;color:rgba(235,235,245,0.3);margin-top:3px}
+
+      /* ── Shoe zone ────────────────────────────────────────────────────── */
+      .bv-regime-badge{display:inline-block;font-size:10px;font-weight:600;
+        padding:3px 10px;border-radius:6px;letter-spacing:0.02em;margin-bottom:10px}
+
+      /* ── Model section ────────────────────────────────────────────────── */
+      #bvsb-model{padding-top:4px}
+
+      /* ── Shared primitives ────────────────────────────────────────────── */
       .bv-row{display:flex;justify-content:space-between;align-items:center;
         padding:3px 0;min-width:0}
-      .bv-lbl{color:#4a5070;font-size:10px;white-space:nowrap;
+      .bv-lbl{color:rgba(235,235,245,0.35);font-size:11px;white-space:nowrap;
         overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
-      .bv-val{font-size:11px;font-weight:600;white-space:nowrap;
-        margin-left:6px;flex-shrink:0}
-      .bv-chip{display:inline-flex;align-items:center;gap:3px;
-        background:#10102a;border:1px solid #20205a;border-radius:5px;
-        padding:3px 7px;font-size:10px;white-space:nowrap;margin:2px 2px 2px 0}
-      .bv-leg-row{display:flex;align-items:center;justify-content:space-between;
-        padding:4px 0;border-bottom:1px solid #0d0d22;min-width:0}
-      .bv-leg-row:last-child{border-bottom:none}
-      .bv-leg-name{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;
-        text-overflow:ellipsis;flex:1;min-width:0;display:flex;align-items:center}
-      .bv-leg-meta{font-size:10px;color:#5a6080;white-space:nowrap;
-        margin-left:5px;flex-shrink:0}
-      .bv-bet-tbl{width:100%;border-collapse:collapse;font-size:10px}
-      .bv-bet-tbl td{padding:3px 4px;overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap;max-width:80px}
-      .bv-bet-tbl tr:nth-child(even) td{background:#0a0a20}
-      .bv-reason{font-size:10px;color:#5a6080;padding:2px 0;
+      .bv-val{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:500;
+        white-space:nowrap;margin-left:8px;flex-shrink:0;color:rgba(235,235,245,0.85)}
+      .bv-divider{border:none;border-top:1px solid rgba(255,255,255,0.06);margin:8px 0}
+      .bv-reason{font-size:10px;color:rgba(235,235,245,0.35);
+        padding:2px 0 2px 8px;margin-top:4px;
+        border-left:2px solid rgba(255,255,255,0.1);
         overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .bv-badge{display:inline-flex;align-items:center;gap:4px;
-        font-family:'Cinzel','Palatino Linotype',serif;
-        font-size:9px;font-weight:700;
-        padding:3px 9px;border-radius:5px;letter-spacing:.9px}
-      .bv-badge-bet{background:#00e5ff14;color:#00e5ff;border:1px solid #00e5ff44;
-        text-shadow:0 0 8px #00e5ff80}
-      .bv-badge-opt{background:#ffffff07;color:#4a5070;border:1px solid #ffffff10}
-      .bv-phase{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;
-        border-radius:10px;letter-spacing:.5px}
-      .bv-divider{border:none;border-top:1px solid #0f0f28;margin:8px 0}
+      .bv-chip{display:inline-flex;align-items:center;gap:4px;
+        background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);
+        border-radius:6px;padding:3px 8px;font-size:10px;white-space:nowrap;margin:2px 3px 2px 0}
+      .bv-phase{display:inline-block;font-size:10px;font-weight:500;padding:2px 7px;border-radius:5px}
+      .bv-bet-tbl{width:100%;border-collapse:collapse;font-size:10px}
+      .bv-bet-tbl td{padding:4px 4px}
+      .bv-bet-tbl tr:nth-child(even) td{background:rgba(255,255,255,0.03)}
 
-      /* ── Animations ─────────────────────────────────────────────────────── */
+      /* ── Animations ───────────────────────────────────────────────────── */
 
-      /* Radar ring pings outward from orb */
-      @keyframes bv-ring-out{0%{transform:scale(1);opacity:.72}100%{transform:scale(2.6);opacity:0}}
-      .bv-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid currentColor;
-        animation:bv-ring-out .9s ease-out forwards;pointer-events:none}
+      /* Radar ring from pick anchor */
+      @keyframes bv-ring-out{0%{transform:scale(1);opacity:.5}100%{transform:scale(2.4);opacity:0}}
+      .bv-ring{position:absolute;inset:0;border-radius:50%;
+        border:1px solid currentColor;
+        animation:bv-ring-out .7s ease-out forwards;pointer-events:none}
 
-      /* Orb breathe while BET is active */
-      @keyframes bv-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.055)}}
-      .bv-orb-breathe{animation:bv-breathe 1.8s ease-in-out infinite}
+      /* BET badge breathe */
+      @keyframes bv-breathe{0%,100%{opacity:1}50%{opacity:.75}}
+      .bv-orb-breathe{animation:bv-breathe 2.5s ease-in-out infinite}
 
-      /* BET unlock radial burst */
-      @keyframes bv-burst{0%{opacity:.85;transform:scale(1)}100%{opacity:0;transform:scale(3)}}
-      .bv-burst{position:absolute;inset:0;border-radius:50%;
-        background:radial-gradient(circle,#00e5ff60 0%,#c97bff20 50%,transparent 70%);
-        animation:bv-burst .6s ease-out forwards;pointer-events:none}
+      /* BET first-activate burst (blue radial) */
+      @keyframes bv-burst{0%{opacity:.55;transform:scale(1)}100%{opacity:0;transform:scale(2.8)}}
+      .bv-burst{position:absolute;inset:-8px;border-radius:50%;
+        background:radial-gradient(circle,rgba(10,132,255,0.3) 0%,transparent 70%);
+        animation:bv-burst .55s ease-out forwards;pointer-events:none}
 
-      /* Win / lose edge flash */
+      /* Win/lose edge flash */
       @keyframes bv-flash-win{
-        0%,100%{box-shadow:0 0 32px #00e5ff10,0 12px 40px #00000099}
-        35%{box-shadow:0 0 0 3px #00ff9450,0 0 52px #00ff9422,0 12px 40px #00000099}}
+        0%,100%{box-shadow:0 24px 60px rgba(0,0,0,0.65);transform:none}
+        18%{transform:translateY(-2px);box-shadow:0 0 0 2px rgba(48,209,88,0.55),0 24px 60px rgba(0,0,0,0.65)}
+        40%{transform:translateY(1.5px)}58%{transform:none}}
       @keyframes bv-flash-lose{
-        0%,100%{box-shadow:0 0 32px #00e5ff10,0 12px 40px #00000099;transform:none}
-        20%{transform:translateX(-2px);box-shadow:0 0 0 3px #ff3d7150,0 12px 40px #00000099}
-        40%{transform:translateX(2px)}
-        60%{transform:none;box-shadow:0 0 0 3px #ff3d7130,0 12px 40px #00000099}}
-      .bv-flash-win{animation:bv-flash-win .75s ease-out forwards}
-      .bv-flash-lose{animation:bv-flash-lose .7s ease-out forwards}
+        0%,100%{box-shadow:0 24px 60px rgba(0,0,0,0.65);transform:none}
+        18%{transform:translateX(-1.5px);box-shadow:0 0 0 2px rgba(255,69,58,0.5),0 24px 60px rgba(0,0,0,0.65)}
+        40%{transform:translateX(1.5px)}58%{transform:none}}
+      .bv-flash-win{animation:bv-flash-win .55s ease-out forwards}
+      .bv-flash-lose{animation:bv-flash-lose .55s ease-out forwards}
 
-      /* New-shoe scan wipe across header */
-      @keyframes bv-scan-wipe{0%{left:0;opacity:.8}100%{left:100%;opacity:0}}
-      .bv-scan-wipe{position:absolute;top:0;bottom:0;width:3px;
-        background:linear-gradient(180deg,transparent,#ffffff,transparent);
-        pointer-events:none;animation:bv-scan-wipe .6s ease-in forwards}
+      /* New-shoe scan wipe */
+      @keyframes bv-scan-wipe{0%{left:0;opacity:.6}100%{left:100%;opacity:0}}
+      .bv-scan-wipe{position:absolute;top:0;bottom:0;width:2px;
+        background:linear-gradient(180deg,transparent,rgba(255,255,255,0.6),transparent);
+        pointer-events:none;animation:bv-scan-wipe .5s ease-in forwards}
 
-      /* Title shimmer via ::after */
-      .bv-logo{position:relative;display:inline-block}
-      .bv-logo::after{content:'';position:absolute;top:0;left:-110%;width:55%;height:100%;
-        background:linear-gradient(90deg,transparent,rgba(255,255,255,.26),transparent);
-        animation:bv-logo-shimmer 9s ease-in-out infinite;pointer-events:none}
-      @keyframes bv-logo-shimmer{0%,28%{left:-110%}58%,100%{left:230%}}
-
-      /* Title letter-spacing pulse on BET first-activate */
-      @keyframes bv-logo-widen{0%{letter-spacing:3px}40%{letter-spacing:7px}100%{letter-spacing:3px}}
-      .bv-logo-widen{animation:bv-logo-widen .75s ease-out}
-
-      /* BET badge glow pulse at ~1 Hz */
+      /* BET badge glow — color driven by --bc1/--bc2 CSS vars set inline on the element */
       @keyframes bv-badge-glow{
-        0%,100%{box-shadow:0 0 5px #00e5ff28,inset 0 0 3px transparent}
-        50%{box-shadow:0 0 18px #00e5ff90,0 0 30px #00e5ff28,inset 0 0 7px #00e5ff18}}
-      .bv-badge-pulse{animation:bv-badge-glow 1s ease-in-out infinite}
+        0%,100%{box-shadow:none}
+        50%{box-shadow:0 0 10px var(--bc1,rgba(10,132,255,0.45)),0 0 18px var(--bc2,rgba(10,132,255,0.2))}}
+      .bv-badge-pulse{animation:bv-badge-glow 1.3s ease-in-out infinite}
 
-      /* Floating balance delta */
-      @keyframes bv-float{0%{transform:translateY(0);opacity:1}100%{transform:translateY(-32px);opacity:0}}
-      .bv-float-delta{position:fixed;font-size:13px;font-weight:800;pointer-events:none;
-        z-index:2147483648;animation:bv-float 1.1s ease-out forwards;white-space:nowrap;
-        font-family:'Cinzel','Palatino Linotype',serif;letter-spacing:.5px}
+      /* Balance delta float */
+      @keyframes bv-float{0%{transform:translateY(0);opacity:1}100%{transform:translateY(-28px);opacity:0}}
+      .bv-float-delta{position:fixed;font-family:"JetBrains Mono",monospace;
+        font-size:13px;font-weight:600;pointer-events:none;
+        z-index:2147483648;animation:bv-float 1s ease-out forwards;white-space:nowrap}
 
       /* Dragon badge shake */
       @keyframes bv-shake{0%,100%{transform:none}
-        18%{transform:translateX(-4px)}38%{transform:translateX(4px)}
-        55%{transform:translateX(-3px)}72%{transform:translateX(3px)}}
-      .bv-shake{animation:bv-shake .48s ease-in-out}
+        18%{transform:translateX(-3px)}38%{transform:translateX(3px)}
+        55%{transform:translateX(-2px)}72%{transform:translateX(2px)}}
+      .bv-shake{animation:bv-shake .42s ease-in-out}
 
-      /* Bead row pop-in + streak wave */
-      @keyframes bv-bead-pop{0%{transform:scale(0)}62%{transform:scale(1.45)}100%{transform:scale(1)}}
-      @keyframes bv-bead-wave{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
-      .bv-bead{display:inline-block;width:10px;height:10px;border-radius:50%;
-        margin:2px 2px;vertical-align:middle;flex-shrink:0}
-      .bv-bead-new{animation:bv-bead-pop .24s ease-out both}
+      /* Bead pop-in + streak wave */
+      @keyframes bv-bead-pop{0%{transform:scale(0)}60%{transform:scale(1.35)}100%{transform:scale(1)}}
+      @keyframes bv-bead-wave{0%,100%{transform:translateY(0)}50%{transform:translateY(-2.5px)}}
+      .bv-bead{display:inline-block;width:11px;height:11px;border-radius:50%;
+        margin:2px 3px;vertical-align:middle;flex-shrink:0}
+      .bv-bead-new{animation:bv-bead-pop .22s ease-out both}
       .bv-bead-wave{animation:bv-bead-wave .65s ease-in-out infinite}
 
-      /* Section header first-data sweep */
-      @keyframes bv-sweep{0%{left:-100%;opacity:.7}100%{left:210%;opacity:0}}
+      /* Zone first-data sweep */
+      @keyframes bv-sweep{0%{left:-100%;opacity:.5}100%{left:210%;opacity:0}}
       .bv-sweep{position:absolute;top:0;bottom:0;left:-100%;width:55%;
-        background:linear-gradient(90deg,transparent,#00e5ff1a,transparent);
-        pointer-events:none;animation:bv-sweep .55s ease-out forwards}
+        background:linear-gradient(90deg,transparent,rgba(255,255,255,0.05),transparent);
+        pointer-events:none;animation:bv-sweep .5s ease-out forwards}
 
-      /* Chevron open / close bounce */
-      @keyframes bv-chev-down{0%,100%{transform:translateY(0)}42%{transform:translateY(3px)}72%{transform:translateY(-1px)}}
-      @keyframes bv-chev-up{0%,100%{transform:translateY(0)}42%{transform:translateY(-3px)}72%{transform:translateY(1px)}}
-      .bv-chev-open{animation:bv-chev-down .32s ease-out}
-      .bv-chev-close{animation:bv-chev-up .32s ease-out}
+      /* Chevron bounce */
+      @keyframes bv-chev-down{0%,100%{transform:rotate(0)}42%{transform:rotate(90deg) translateX(1px)}100%{transform:rotate(90deg)}}
+      @keyframes bv-chev-up{0%{transform:rotate(90deg)}100%{transform:rotate(0)}}
+      .bv-chev-open{animation:bv-chev-down .25s ease-out forwards}
+      .bv-chev-close{animation:bv-chev-up .25s ease-out forwards}
 
-      /* Bar fill shimmer glint */
-      @keyframes bv-glint{0%{left:-80%;opacity:0}15%{opacity:.45}80%{opacity:.3}100%{left:130%;opacity:0}}
+      /* Bar shimmer — subtle */
+      @keyframes bv-glint{0%{left:-80%;opacity:0}20%{opacity:.2}80%{opacity:.15}100%{left:130%;opacity:0}}
       .bv-bar-fill{position:relative;overflow:hidden}
       .bv-bar-fill::after{content:'';position:absolute;top:0;bottom:0;left:-80%;width:40%;
-        background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);
-        animation:bv-glint 2.6s ease-in-out infinite;pointer-events:none}
+        background:linear-gradient(90deg,transparent,rgba(255,255,255,.3),transparent);
+        animation:bv-glint 3s ease-in-out infinite;pointer-events:none}
 
-      /* Rotating neon border ring — slow hue cycle (30 s) */
-      @keyframes bv-ring-hue{
-        0%{border-color:#00e5ff28}25%{border-color:#c97bff22}
-        50%{border-color:#00ff9422}75%{border-color:#ffd70018}100%{border-color:#00e5ff28}}
-      #bv-border-ring{position:absolute;inset:0;border-radius:13px;
-        border:1px solid #00e5ff28;pointer-events:none;z-index:0;
-        animation:bv-ring-hue 30s linear infinite;
-        transition:border-color 1.5s ease,box-shadow 1.5s ease}
+      /* Border ring — subtle opacity breathe */
+      @keyframes bv-ring-hue{0%,100%{border-color:rgba(255,255,255,0.08)}
+        50%{border-color:rgba(255,255,255,0.15)}}
+      #bv-border-ring{position:absolute;inset:0;border-radius:15px;
+        border:1px solid rgba(255,255,255,0.08);pointer-events:none;z-index:0;
+        animation:bv-ring-hue 10s ease-in-out infinite;
+        transition:border-color 1s ease,box-shadow 1s ease}
+
+      /* Pick zone fade-pulse on BET activate */
+      @keyframes bv-pick-pulse{0%{opacity:1}25%{opacity:.7}100%{opacity:1}}
+      .bv-pick-pulse{animation:bv-pick-pulse 0.4s ease-out}
     `;
     document.head.appendChild(s);
   }
@@ -781,33 +1094,58 @@
     injectCSS();
     panel = document.createElement("div");
     panel.id = "bv-panel";
-    // Animated neon border ring — sits below all content (z-index:0)
-    const _bvBorderRing = document.createElement("div");
-    _bvBorderRing.id = "bv-border-ring";
-    panel.appendChild(_bvBorderRing);
 
-    // ── Header (drag handle + minimize) ──
+    // Subtle animated border ring
+    const borderRing = document.createElement("div");
+    borderRing.id = "bv-border-ring";
+    panel.appendChild(borderRing);
+
+    // ── Header ──────────────────────────────────────────────────────────────
     const hdr = document.createElement("div");
     hdr.id = "bv-hdr";
     hdr.innerHTML =
-      `<div class="bv-logo">BACCARAT VISION</div>` +
-      `<div id="bv-status">starting…</div>` +
-      `<button id="bv-min" title="Minimise">&#x2013;</button>`;
+      `<div id="bv-grip">⠿</div>` +
+      `<div id="bv-wordmark-wrap">` +
+        `<div id="bv-wordmark">BACCARAT VISION</div>` +
+        `<div id="bv-status">starting…</div>` +
+      `</div>` +
+      `<div id="bv-live-wrap">` +
+        `<div id="bv-live-dot"></div>` +
+        `<div id="bv-live-label">LIVE</div>` +
+      `</div>` +
+      `<button id="bv-min" title="Minimise">&#x2013;</button>` +
+      `<div id="bv-shoe-bar-track"><div id="bv-shoe-bar-fill"></div></div>`;
     panel.appendChild(hdr);
     statusEl = panel.querySelector("#bv-status");
 
-    // ── Minimise toggle ──
+    // ── Body ────────────────────────────────────────────────────────────────
     const body = document.createElement("div");
     body.id = "bv-body";
+
+    // Collapsible sections — IDs match the #bvsb-{id} lookup used by $()
+    const secPick    = makeSection("pick",    "Next Pick",           true);
+    const secAlloc   = makeSection("alloc",   "Allocation",          true);
+    const secSession = makeSection("session", "Session",             false); // default collapsed
+    const secPattern = makeSection("pattern", "Last Hand & Pattern", true);
+    const secModel   = makeSection("model",   "AI Model",            false);
+
+    // #bvsb-spread lives inside the alloc section body so spread render + bv-locked still work
+    const spreadInner = document.createElement("div");
+    spreadInner.id = "bvsb-spread";
+    secAlloc.querySelector(".bvsb").appendChild(spreadInner);
+
+    [secPick, secAlloc, secSession, secPattern, secModel].forEach(s => body.appendChild(s));
     panel.appendChild(body);
+
+    // ── Minimise toggle ──────────────────────────────────────────────────────
     panel.querySelector("#bv-min").addEventListener("click", (e) => {
       e.stopPropagation();
       _minimised = !_minimised;
-      body.style.display = _minimised ? "none" : "block";
+      _minimised ? _secHide(body) : _secShow(body);
       panel.querySelector("#bv-min").innerHTML = _minimised ? "&#x25A1;" : "&#x2013;";
     });
 
-    // ── Dragging ──
+    // ── Drag ────────────────────────────────────────────────────────────────
     let ox = 0, oy = 0, dragging = false;
     hdr.addEventListener("mousedown", (e) => {
       if (e.target.id === "bv-min") return;
@@ -825,22 +1163,17 @@
     });
     document.addEventListener("mouseup", () => { dragging = false; });
 
-    // ── Sections (in body div) ──
-    const secPick    = makeSection("pick",    "target",      "Next Pick",  true);
-    const secSpread  = makeSection("spread",  "coins",       "Bet Spread", true);
-    const secPattern = makeSection("pattern", "bar-chart",   "Pattern",    true);
-    const secModel   = makeSection("model",   "cpu",         "AI Engine",  true);
-    const secBalance = makeSection("balance", "wallet",      "Balance",    true);
-    const secSession = makeSection("session", "trending-up", "Session",    true);
-    const secHand    = makeSection("hand",    "layers",      "Last Hand",  false);
-    const secBets    = makeSection("bets",    "list",        "All Bets",   false);
-    [secPick, secSpread, secPattern, secModel, secBalance, secSession, secHand, secBets]
-      .forEach((s) => body.appendChild(s));
-
     document.body.appendChild(panel);
   }
 
-  function setStatus(s) { ensurePanel(); if (statusEl) statusEl.textContent = s; }
+  function setStatus(s, shoePct) {
+    ensurePanel();
+    if (statusEl) statusEl.textContent = s;
+    if (shoePct !== undefined) {
+      const fill = panel.querySelector("#bv-shoe-bar-fill");
+      if (fill) fill.style.width = Math.max(0, Math.min(100, shoePct * 100)).toFixed(1) + "%";
+    }
+  }
 
   function $(id) { return panel ? panel.querySelector(`#bvsb-${id}`) : null; }
 
@@ -850,17 +1183,16 @@
     if (!vs || !vs.votes || !Object.keys(vs.votes).length) return "";
     const total = Object.values(vs.votes).reduce((a, b) => a + b, 0) || 1;
     const items = Object.entries(vs.votes)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
+      .sort((a, b) => b[1] - a[1]).slice(0, 3)
       .map(([bet, w]) => {
         const pct = (w / total * 100).toFixed(0);
-        const c = BET_COLOR[bet] || "#b0b8d8";
+        const c = BET_COLOR[bet] || "rgba(235,235,245,0.6)";
         return `<span class="bv-chip"><span style="color:${c}">${BET_NAMES[bet] || bet}</span>` +
-               `<span style="color:#4a5070"> ${pct}%</span></span>`;
+               `<span style="color:rgba(235,235,245,0.3)"> ${pct}%</span></span>`;
       }).join("");
     const dissent = (vs.top_dissent || []).slice(0, 2).join(", ");
     return `<hr class="bv-divider">` +
-      `<div style="font-size:10px;color:#4a5070;margin-bottom:3px">Expert votes (${(vs.agreement * 100).toFixed(0)}% agree)</div>` +
+      `<div style="font-size:10px;color:rgba(235,235,245,0.3);margin-bottom:3px">Experts · ${(vs.agreement * 100).toFixed(0)}% agree</div>` +
       `<div>${items}</div>` +
       (dissent ? `<div class="bv-reason" style="margin-top:3px">Dissent: ${dissent}</div>` : "");
   }
@@ -871,20 +1203,19 @@
     if (rows.length < 2) return "";
     const rowHtml = rows.map((c) => {
       const diff = c.actual_rate - c.expected_rate;
-      const col = Math.abs(diff) < 0.05 ? "#00ff94" : Math.abs(diff) < 0.12 ? "#ffd700" : "#ff3d71";
+      const col = Math.abs(diff) < 0.05 ? "#30d158" : Math.abs(diff) < 0.12 ? "#ffd60a" : "#ff453a";
       return `<div class="bv-row">` +
         `<span class="bv-lbl">${c.bin_label}</span>` +
         `<span class="bv-val" style="color:${col}">${(c.actual_rate * 100).toFixed(0)}%` +
-        ` <span style="color:#4a5070;font-size:9px">vs ${(c.expected_rate * 100).toFixed(0)}% (n=${c.n})</span></span></div>`;
+        ` <span style="color:rgba(235,235,245,0.25);font-size:9px">vs ${(c.expected_rate * 100).toFixed(0)}% (n=${c.n})</span></span></div>`;
     }).join("");
     return `<hr class="bv-divider">` +
-      `<div style="font-size:10px;color:#4a5070;margin-bottom:3px">Calibration</div>` +
-      rowHtml;
+      `<div style="font-size:10px;color:rgba(235,235,245,0.3);margin-bottom:3px">Calibration</div>` + rowHtml;
   }
 
   function renderTemplateMatch(tm) {
     if (!tm) return "";
-    const col = tm.pick === "B" ? "#ff3d71" : tm.pick === "P" ? "#00b4ff" : "#00ff94";
+    const col = tm.pick === "B" ? "#ff453a" : tm.pick === "P" ? "#0a84ff" : "#30d158";
     const name = tm.pick === "B" ? "Banker" : tm.pick === "P" ? "Player" : "Tie";
     return `<hr class="bv-divider">` +
       `<div class="bv-row" style="margin-top:2px">` +
@@ -894,16 +1225,76 @@
       `B${(tm.b_pct * 100).toFixed(0)}% P${(tm.p_pct * 100).toFixed(0)}% T${(tm.t_pct * 100).toFixed(0)}%</div>`;
   }
 
+  // ─── Session-aware bet spread suggestion ──────────────────────────────────
+  // vibe: normalized 0-1 model confidence (m.vibe, already normalized by caller)
+  function calcSuggestedSpread(bk, st, sess, shoeHistory, vibe) {
+    if (!bk || !bk.balance || !st || !st.spread_legs || !st.spread_legs.length) return null;
+    const balance = bk.balance;
+    const conf = (typeof vibe === "number" && vibe > 0) ? vibe : 0.5;
+
+    // Base: 15% of balance per hand (conservative starting point)
+    let pct = 0.15;
+
+    // Model confidence modifier
+    if (conf >= 0.70) pct = 0.22;
+    else if (conf >= 0.65) pct = 0.19;
+    else if (conf < 0.52) pct = 0.10;
+    else if (conf < 0.48) pct = 0.07;
+
+    // Session win rate modifier (requires at least 5 tracked hands)
+    const totalHands = sess.wins + sess.losses;
+    if (totalHands >= 5) {
+      const wr = sess.wins / totalHands;
+      if (wr >= 0.58)      pct *= 1.15;  // strong winning session
+      else if (wr >= 0.53) pct *= 1.07;  // slightly positive
+      else if (wr <= 0.40) pct *= 0.70;  // losing badly
+      else if (wr <= 0.45) pct *= 0.85;  // slightly below break-even
+    }
+
+    // Recent shoe trend (last 2 completed shoes)
+    const recent = shoeHistory.slice(-2);
+    if (recent.length >= 1) {
+      const recentPL = recent.reduce((s, sh) => s + sh.pl, 0);
+      if (recentPL < -balance * 0.04)      pct *= 0.80;  // significant drawdown
+      else if (recentPL < -balance * 0.01) pct *= 0.90;  // mild loss trend
+      else if (recentPL > balance * 0.04)  pct *= 1.10;  // winning trend
+    }
+
+    // Clamp to sensible range: 5% – 25% of balance
+    pct = Math.max(0.05, Math.min(0.25, pct));
+
+    const suggestedTotal = Math.round(balance * pct);
+
+    // Scale server's spread legs proportionally to our suggested total
+    const serverTotal = st.spread_total > 0
+      ? st.spread_total
+      : st.spread_legs.reduce((s, g) => s + (g.stake || 0), 0);
+    const scale = serverTotal > 0 ? suggestedTotal / serverTotal : 1;
+
+    return {
+      total: suggestedTotal,
+      pct,
+      legs: st.spread_legs.map(g => ({
+        ...g,
+        stake: Math.round((g.stake || 0) * scale),
+      })),
+    };
+  }
+
   // ─── Render ────────────────────────────────────────────────────────────────
   function render(data, hand, counter) {
     ensurePanel();
-    setStatus(`H${counter.hand} · ${counter.P}P ${counter.B}B ${counter.T}T`);
+    const shoePct = counter.hand / 72;
+    const shoePctStr = (shoePct * 100).toFixed(0);
+    setStatus(`Hand ${counter.hand}/72 · ${counter.P}P ${counter.B}B ${counter.T}T · ${shoePctStr}%`, shoePct);
     if (_minimised) return;
 
     // ── New shoe scan wipe ──────────────────────────────────────────────────
     if (_prevHandNum > 5 && counter.hand <= 2) {
       _handHistory = [];
       _sectionInited = {};
+      _prevHandWinner = null;
+      _lastHandBetFollowed = false;
       scanNewShoe();
     }
     _prevHandNum = counter.hand;
@@ -913,10 +1304,15 @@
       _handHistory.push(hand.winner);
       if (_handHistory.length > 14) _handHistory.shift();
     }
+    // Post-verify: bead history must not exceed total hands played in the shoe.
+    // If the observer + interval fired concurrently before the _tickRunning guard
+    // was fully in place, spurious extra beads can appear — trim from the newest end.
+    const _maxBeads = Math.min(counter.hand, 14);
+    while (_handHistory.length > _maxBeads) _handHistory.pop();
 
     if (!data) {
       const el = $("pick");
-      if (el) el.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f00;font-size:11px">${icon("alert-triangle",13,"#ff9f00")} Engine offline — run the server</div>`;
+      if (el) el.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f0a;font-size:11px">${icon("alert-triangle",13,"#ff9f0a")} Engine offline — run the server</div>`;
       return;
     }
 
@@ -928,20 +1324,23 @@
     const pat = data.pattern;
     const cur = (st && st.currency) || (bk && bk.currency) || "";
 
-    // ── Win / lose edge flash ───────────────────────────────────────────────
+    // ── Win / lose edge flash (fallback — only runs when balance delta undetectable) //
     if (hand && session.betSignalledPick) {
       const winnerMap = { player: "P", banker: "B", tie: "T" };
-      edgeFlash(hand.winner === winnerMap[session.betSignalledPick] ? "win" : "lose");
+      const isWin = hand.winner === winnerMap[session.betSignalledPick];
+      edgeFlash(isWin ? "win" : "lose");
+      _lastHandBetFollowed = true;
+      if (isWin) session.wins++; else session.losses++;
     }
 
     // ── Regime border ───────────────────────────────────────────────────────
-    const _regimeColors = { Dragon:"#ff3d71", Choppy:"#00ff94", Mixed:"#ffd700", Forming:"#c97bff" };
+    const _regimeColors = { Dragon:"#ff453a", Choppy:"#30d158", Mixed:"#ffd60a", Forming:"#bf5af2" };
     const _regimeCol = pat && _regimeColors[pat.personality];
     const _bRing = panel && panel.querySelector("#bv-border-ring");
     if (_bRing) {
       if (_regimeCol) {
-        _bRing.style.borderColor = _regimeCol + "45";
-        _bRing.style.boxShadow   = `0 0 20px ${_regimeCol}18`;
+        _bRing.style.borderColor = _regimeCol + "55";
+        _bRing.style.boxShadow   = `0 0 16px ${_regimeCol}20`;
         _bRing.style.animationPlayState = "paused";
       } else {
         _bRing.style.borderColor = "";
@@ -955,110 +1354,130 @@
     if (pickEl && m && m.pick) {
       if (!_sectionInited.pick) { sweepSection("pick"); _sectionInited.pick = true; }
 
-      const col = m.confident ? (BET_COLOR[m.pick] || "#b0b8d8") : "#4a5070";
-      const letter = m.pick === "banker" ? "B" : m.pick === "player" ? "P"
-                   : m.pick === "tie"    ? "T" : m.pick[0].toUpperCase();
-      // Badge includes pulse class when BET is active (drives 1 Hz glow)
+      const col = m.confident ? (BET_COLOR[m.pick] || "rgba(235,235,245,0.85)") : "rgba(235,235,245,0.22)";
+      // Normalize vibe: API sometimes returns 0-100 scale instead of 0-1
+      const vibe = (() => { const v = m.vibe || 0; return v > 1 ? v / 100 : v; })();
+      const pickName = (m.pick_label || m.pick).toUpperCase();
       const badge = m.confident
-        ? `<span class="bv-badge bv-badge-bet bv-badge-pulse">${icon("diamond",9,"#00e5ff")} BET</span>`
+        ? `<span class="bv-badge bv-badge-bet bv-badge-pulse" style="color:${col};background:${col}1a;border-color:${col}40;--bc1:${col}73;--bc2:${col}33">${icon("diamond",9,col)} BET</span>`
         : `<span class="bv-badge bv-badge-opt">WAIT</span>`;
-      const stakeStr = st ? `${fmtK(st.stake)}${cur ? " " + cur : ""}` : "—";
-      const vibe = m.vibe || 0;
-
-      // Unlock arc — shown as a circular progress ring around the orb while waiting
-      const showArc = !m.confident && L && (L.acts || 0) > 0;
-      const arcPct  = showArc ? Math.min(1, (L.acts || 0) / (L.min_hands || 15)) : 0;
+      const stakeStr = (st && st.stake) ? `${fmtK(st.stake)}${cur ? " " + cur : ""}` : "";
 
       let unlockHtml = "";
       if (L) {
         if (m.confident) {
           const proven = L.significant ? "proven edge" : "net +edge";
-          unlockHtml = `<div class="bv-reason" style="display:flex;align-items:center;gap:4px;color:#00ff94;margin-top:5px">${icon("check",10,"#00ff94")} ${proven} · ${L.acts} hands graded</div>`;
+          unlockHtml = `<div style="display:flex;align-items:center;gap:4px;color:#30d158;` +
+            `font-size:11px;font-weight:500;margin-top:6px">` +
+            `${icon("check",11,"#30d158")} ${proven} · ${L.acts} hands</div>`;
         } else {
           const have = L.acts || 0, need = L.min_hands || 15;
           const pph = (L.profit_per_hand || 0) * 100;
-          const why = have < need ? `${have}/${need} hands`
-            : pph <= 0 ? `P/H ${pph.toFixed(1)}` : "building confidence";
-          unlockHtml = `<div class="bv-reason" style="display:flex;align-items:center;gap:4px;margin-top:5px">${icon("lock",10,"#5a6080")} BET unlocks: ${why}</div>`;
+          const why = have < need ? `${have}/${need} hands` : pph <= 0 ? `P/H ${pph.toFixed(1)}` : "building confidence";
+          unlockHtml = `<div style="display:flex;align-items:center;gap:4px;` +
+            `color:rgba(235,235,245,0.4);font-size:11px;margin-top:6px">` +
+            `${icon("lock",11,"rgba(235,235,245,0.3)")} BET unlocks: ${why}</div>`;
         }
       }
 
-      const reasons = (m.reasons || []).slice(0, 2)
-        .map((r) => `<div class="bv-reason">• ${r}</div>`).join("");
-
-      const orbClass = m.confident ? "bv-orb bv-orb-breathe" : "bv-orb";
+      const topReason = (m.reasons || [])[0];
+      const reasonHtml = topReason
+        ? `<div style="font-size:11px;color:rgba(235,235,245,0.5);padding:3px 0 3px 10px;` +
+          `margin-top:4px;border-left:2px solid ${col}50;overflow:hidden;text-overflow:ellipsis;` +
+          `white-space:nowrap">${topReason.length > 58 ? topReason.slice(0, 58) + "…" : topReason}</div>`
+        : "";
 
       pickEl.innerHTML =
-        `<div style="display:flex;align-items:center;gap:14px;padding:4px 2px 10px">` +
-        // Orb wrapper — position:relative lets arc SVG and ring/burst children anchor here
-        `<div id="bv-orb-wrap" style="position:relative;width:62px;height:62px;flex-shrink:0">` +
-        `<div class="${orbClass}" style="width:100%;height:100%;background:${col}16;` +
-        `border:2px solid ${col}50;filter:drop-shadow(0 0 14px ${col});color:${col}">${letter}</div>` +
-        (showArc ? arcSvg(arcPct) : "") +
-        `</div>` +
+        `<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">` +
         `<div style="flex:1;min-width:0">` +
-        `<div style="font-family:'Cinzel','Palatino Linotype',serif;font-size:19px;font-weight:700;` +
-        `color:${col};letter-spacing:.5px;line-height:1.1;margin-bottom:6px;white-space:nowrap;` +
-        `overflow:hidden;text-overflow:ellipsis">${m.pick_label.toUpperCase()}</div>` +
-        `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">` +
+        `<div id="bv-pick-name" style="color:${col}">${pickName}</div>` +
+        `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:6px">` +
         badge +
-        `<span style="font-size:12px;font-weight:700;color:#00e5ff">${stakeStr}</span>` +
-        `</div></div></div>` +
-        bar(vibe, col, 5) +
-        `<div class="bv-row" style="margin-top:5px">` +
-        `<span class="bv-lbl">Confidence</span>` +
-        `<span class="bv-val" style="color:${col}">${(vibe * 100).toFixed(0)}%</span></div>` +
-        unlockHtml + reasons;
+        `<span id="bv-confidence-num" style="color:${col};background:${col}1a;padding:2px 8px;` +
+        `border-radius:6px;font-size:11px;font-weight:600;letter-spacing:0.02em">` +
+        `${(vibe * 100).toFixed(0)}%</span>` +
+        `</div>` +
+        unlockHtml + reasonHtml +
+        `</div>` +
+        `<div style="flex-shrink:0;text-align:right">` +
+        (stakeStr ? `<div id="bv-pick-stake">${stakeStr}</div>` : "") +
+        `<div id="bv-pick-ring" style="position:relative;width:36px;height:36px;margin:${stakeStr ? "6px" : "0"} 0 0 auto;border-radius:50%"></div>` +
+        `</div>` +
+        `</div>` +
+        `<div style="margin-top:9px">${bar(vibe, col, 2)}</div>`;
 
-      // Post-render: radar ping on every hand
-      const orbWrap = pickEl.querySelector("#bv-orb-wrap");
-      pingOrb(orbWrap);
+      // Pick ring — color kept current; animation fires contextually below
+      const ringEl = pickEl.querySelector("#bv-pick-ring");
+      if (ringEl) ringEl.dataset.col = col;
 
-      // BET first-activate: radial burst + title letter-spacing widen
+      // BET first-activate: burst (pick color, not blue) + pick-name fade pulse
       if (m.confident && !_prevConfident) {
-        if (orbWrap) {
+        if (ringEl) {
           const b = document.createElement("div");
           b.className = "bv-burst";
-          orbWrap.appendChild(b);
-          setTimeout(() => b.remove(), 680);
+          b.style.background = `radial-gradient(circle,${col}4d 0%,transparent 70%)`;
+          ringEl.appendChild(b);
+          setTimeout(() => b.remove(), 650);
         }
-        const logo = panel && panel.querySelector(".bv-logo");
-        if (logo) {
-          logo.classList.remove("bv-logo-widen");
-          void logo.offsetWidth;
-          logo.classList.add("bv-logo-widen");
-          setTimeout(() => logo.classList.remove("bv-logo-widen"), 800);
+        const nameEl = pickEl.querySelector("#bv-pick-name");
+        if (nameEl) {
+          nameEl.classList.remove("bv-pick-pulse");
+          void nameEl.offsetWidth;
+          nameEl.classList.add("bv-pick-pulse");
+          setTimeout(() => nameEl.classList.remove("bv-pick-pulse"), 450);
         }
       }
       _prevConfident = m.confident;
+
+      // Section header: show pick name + state; colored left border when BET active
+      const pickSecVal = panel && panel.querySelector("#bvsecv-pick");
+      if (pickSecVal) {
+        pickSecVal.textContent = m.confident ? pickName : "waiting…";
+        pickSecVal.style.color = m.confident ? col : "rgba(235,235,245,0.2)";
+      }
+      const pickSection = pickEl && pickEl.closest(".bv-section");
+      if (pickSection) {
+        pickSection.style.boxShadow = m.confident
+          ? `inset 3px 0 0 ${col}, inset 0 0 0 0 transparent`
+          : "";
+        pickSection.style.transition = "box-shadow 0.4s ease";
+      }
+    }
+
+    // ── Track last hand winner (for future state tracking) ──────────────── //
+    if (hand && hand.winner && hand.winner !== _prevHandWinner) {
+      _lastHandBetFollowed = false;
+      _prevHandWinner = hand.winner;
     }
 
     // ── Bet Spread ───────────────────────────────────────────────────────── //
     const spreadEl = $("spread");
     if (spreadEl) {
+      // Toggle locked appearance when no BET signal
+      spreadEl.classList.toggle("bv-locked", !(m && m.confident));
       if (!_sectionInited.spread && ds && ds.legs && ds.legs.length) { sweepSection("spread"); _sectionInited.spread = true; }
       let html = "";
 
       // Dynamic spread (probability-driven, has EV)
       if (ds && ds.legs && ds.legs.length) {
-        const phaseColor = { early: "#4a5070", mid: "#ffd700", late: "#00ff94" }[ds.phase] || "#4a5070";
+        const phaseColor = { early: "rgba(235,235,245,0.3)", mid: "#ffd60a", late: "#30d158" }[ds.phase] || "rgba(235,235,245,0.3)";
         const phaseDot  = { early: "○", mid: "◑", late: "●" }[ds.phase] || "○";
         const phaseLabel = { early: "Early shoe", mid: "Mid shoe", late: "Late shoe" }[ds.phase] || ds.phase;
-        const multCol  = ds.multiplier > 3 ? "#00ff94" : ds.multiplier > 1.5 ? "#ffd700" : "#4a5070";
+        const multCol  = ds.multiplier > 3 ? "#30d158" : ds.multiplier > 1.5 ? "#ffd60a" : "rgba(235,235,245,0.3)";
         const multNote = ds.multiplier <= 1 ? "hold" : ds.multiplier >= 4 ? "push" : "raise";
 
         html += `<div class="bv-row" style="margin-bottom:7px">` +
           `<span class="bv-phase" style="background:${phaseColor}20;color:${phaseColor};border:1px solid ${phaseColor}40">` +
           `${phaseDot} ${phaseLabel}</span>` +
-          `<span style="font-size:11px;color:${multCol};font-weight:700">${ds.multiplier}× — ${multNote}</span>` +
+          `<span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:${multCol};font-weight:600">${ds.multiplier}× — ${multNote}</span>` +
           `</div>`;
 
-        // Signal bars — human-readable labels
+        // Signal bars
         const sigs = [
-          ["Position", ds.composition_signal, "#00b4ff"],
-          ["AI Model", ds.learner_signal,     "#00ff94"],
-          ["Streak",   ds.pattern_signal,     "#ffd700"],
-          ["Combined", ds.signal,             "#c97bff"],
+          ["Position", ds.composition_signal, "#0a84ff"],
+          ["AI Model", ds.learner_signal,     "#30d158"],
+          ["Streak",   ds.pattern_signal,     "#ffd60a"],
+          ["Combined", ds.signal,             "#bf5af2"],
         ];
         html += sigs.map(([lbl, v, c]) =>
           `<div class="bv-row"><span class="bv-lbl" style="min-width:52px">${lbl}</span>` +
@@ -1066,284 +1485,386 @@
           `<span class="bv-val" style="color:${c};min-width:28px;text-align:right">${(v * 100).toFixed(0)}%</span></div>`
         ).join("");
 
-        html += `<div style="margin-top:6px;border-top:1px solid #12122e;padding-top:6px">`;
+        html += `<div style="margin-top:10px;padding-top:8px">`;
         ds.legs.forEach((leg) => {
-          const lc = BET_COLOR[leg.bet] || "#b0b8d8";
-          const evCol = leg.ev >= 0 ? "#00ff94" : "#ff6b6b";
-          const evTxt = `EV ${leg.ev >= 0 ? "+" : ""}${fmtK(leg.ev)}`;
+          const lc = BET_COLOR[leg.bet] || "rgba(235,235,245,0.4)";
+          // Only show EV label when it's meaningfully positive or unusually negative
+          const showEv = leg.ev > 0 || (leg.ev / (leg.stake || 1)) < -0.05;
+          const evCol = leg.ev >= 0 ? "#30d158" : "#ff453a";
+          const evTxt = showEv ? `EV ${leg.ev >= 0 ? "+" : ""}${fmtK(leg.ev)}` : "";
           html +=
-            `<div class="bv-leg-row">` +
-            `<span class="bv-leg-name" style="color:${lc}">${betDot(leg.bet)}${leg.label}</span>` +
-            `<span class="bv-leg-meta">${fmtK(leg.stake)}${cur ? " " + cur : ""}</span>` +
-            `<span class="bv-leg-meta" style="color:${evCol};margin-left:4px">${evTxt}</span>` +
+            `<div class="bv-leg-row" style="border-left-color:${lc}">` +
+            `<span class="bv-leg-name">${betDot(leg.bet)}${leg.label}</span>` +
+            `<span class="bv-leg-amt">${fmtK(leg.stake)}${cur ? " " + cur : ""}</span>` +
+            (evTxt ? `<span class="bv-leg-ev" style="color:${evCol}">${evTxt}</span>` : "") +
             `</div>`;
         });
-        const totalEvCol = ds.total_ev >= 0 ? "#00ff94" : "#ff6b6b";
+        const totalEvCol = ds.total_ev >= 0 ? "#30d158" : "#ff453a";
         html += `</div>` +
-          `<div class="bv-row" style="margin-top:4px;border-top:1px solid #1a1a35;padding-top:4px">` +
-          `<span class="bv-lbl" style="color:#b0b8d8;font-weight:700">Total at risk</span>` +
-          `<span class="bv-val" style="color:#00e5ff">${fmtK(ds.total_stake)} ${cur}</span></div>` +
+          `<div class="bv-row" style="margin-top:6px">` +
+          `<span class="bv-lbl">Total at risk</span>` +
+          `<span class="bv-val" style="color:rgba(235,235,245,0.85)">${fmtK(ds.total_stake)} ${cur}</span></div>` +
           `<div class="bv-row">` +
           `<span class="bv-lbl">Total EV</span>` +
           `<span class="bv-val" style="color:${totalEvCol}">${ds.total_ev >= 0 ? "+" : ""}${fmtK(ds.total_ev)} ${cur}</span></div>`;
 
-        // Kelly optimal stake
+        // Kelly gauge
         if (ds.kelly_stake > 0) {
-          html += `<div class="bv-row" style="margin-top:3px">` +
-            `<span class="bv-lbl">Kelly optimal</span>` +
-            `<span class="bv-val" style="color:#c97bff">${fmtK(ds.kelly_stake)}${cur ? " " + cur : ""}` +
-            ` <span style="color:#4a5070;font-size:9px">(${(ds.kelly_fraction * 100).toFixed(2)}% bankroll)</span></span></div>`;
+          const kellyPct = Math.min(1, ds.kelly_fraction || 0);
+          const kellyCol = kellyPct > 0.15 ? "#ff453a" : kellyPct > 0.08 ? "#ffd60a" : "#30d158";
+          html += `<div id="bv-kelly-track"><div id="bv-kelly-fill" style="width:${(kellyPct * 100).toFixed(1)}%;background:${kellyCol}"></div></div>` +
+            `<div class="bv-row" style="margin-top:1px">` +
+            `<span class="bv-lbl">Kelly</span>` +
+            `<span class="bv-val" style="color:#bf5af2">${fmtK(ds.kelly_stake)}${cur ? " " + cur : ""} · ${(ds.kelly_fraction * 100).toFixed(2)}%</span></div>`;
         }
         // Pair probability
         if (ds.pair_probs && ds.pair_probs.either_pair != null) {
           const ep = ds.pair_probs.either_pair;
           const bep = ds.pair_probs.baseline_either_pair || 0.001;
           const ratio = ep / bep;
-          const pairCol = ratio >= 1.08 ? "#ffd700" : "#4a5070";
-          html += `<div class="bv-row" style="margin-top:3px">` +
+          const pairCol = ratio >= 1.08 ? "#ffd60a" : "rgba(235,235,245,0.3)";
+          html += `<div class="bv-row" style="margin-top:2px">` +
             `<span class="bv-lbl" style="color:${pairCol}">Pair probability</span>` +
-            `<span class="bv-val" style="color:${pairCol}">${(ep * 100).toFixed(1)}%` +
-            ` <span style="color:#4a5070;font-size:9px">(${ratio >= 1 ? "+" : ""}${((ratio - 1) * 100).toFixed(0)}% vs base)</span></span></div>`;
+            `<span class="bv-val" style="color:${pairCol}">${(ep * 100).toFixed(1)}% ` +
+            `<span style="color:rgba(235,235,245,0.25);font-size:9px">(${ratio >= 1 ? "+" : ""}${((ratio - 1) * 100).toFixed(0)}% vs base)</span></span></div>`;
         }
         if (!ds.affordable) {
-          html += `<div style="display:flex;align-items:center;gap:4px;color:#ff9f00;font-size:10px;margin-top:3px">${icon("alert-triangle",11,"#ff9f00")} scaled to fit balance</div>`;
+          html += `<div style="display:flex;align-items:center;gap:4px;color:#ff9f0a;font-size:10px;margin-top:3px">${icon("alert-triangle",11,"#ff9f0a")} scaled to fit balance</div>`;
         }
       }
 
-      // Pattern side-bet signals (additive to spread)
+      // Pattern side-bet signals
       if (st && st.side_bets && st.side_bets.length) {
-        html += `<div style="margin-top:6px;border-top:1px solid #12122e;padding-top:5px;` +
-          `font-size:10px;color:#4a5070;text-transform:uppercase;letter-spacing:.5px">Pattern signals</div>`;
-        st.side_bets.forEach((s) => {
-          const lc = BET_COLOR[s.bet] || "#b0b8d8";
+        html += `<div style="margin-top:8px;font-size:10px;color:rgba(235,235,245,0.3);text-transform:uppercase;letter-spacing:.5px">Pattern signals</div>`;
+        st.side_bets.forEach((sb) => {
+          const lc = BET_COLOR[sb.bet] || "rgba(235,235,245,0.4)";
           html += `<div class="bv-row">` +
-            `<span class="bv-leg-name" style="color:${lc}">+ ${s.label}</span>` +
-            `<span class="bv-leg-meta">${fmtK(s.stake)}${cur ? " " + cur : ""}</span></div>`;
+            `<span class="bv-leg-name" style="color:${lc}">+ ${sb.label}</span>` +
+            `<span class="bv-leg-amt">${fmtK(sb.stake)}${cur ? " " + cur : ""}</span></div>`;
         });
       }
 
-      // Preset layout (always shown as reference)
-      if (st && st.spread_legs && st.spread_legs.length) {
-        const warn = st.spread_affordable ? "" : ` <span style="display:inline-flex;align-items:center;gap:3px;color:#ff9f00">${icon("alert-triangle",11,"#ff9f00")} over balance</span>`;
-        html += `<div style="margin-top:6px;border-top:1px solid #12122e;padding-top:5px">` +
-          `<div style="font-size:10px;color:#4a5070;text-transform:uppercase;` +
-          `letter-spacing:.5px;margin-bottom:4px">Preset · ${fmtK(st.spread_total)} ${cur}${warn}</div>` +
+      // Actual placed bets (read from DOM) — preferred over server preset
+      const actualBets = readPlacedBets();
+      if (actualBets && Object.keys(actualBets).length) {
+        const actualTotal = Object.values(actualBets).reduce((s, v) => s + v, 0);
+        const warn = bk && bk.balance && actualTotal > bk.balance
+          ? ` <span style="display:inline-flex;align-items:center;gap:3px;color:#ff9f0a">${icon("alert-triangle",11,"#ff9f0a")} over balance</span>`
+          : "";
+        html += `<div style="margin-top:6px;padding-top:5px">` +
+          `<div style="font-size:10px;color:rgba(235,235,245,0.3);text-transform:uppercase;` +
+          `letter-spacing:.5px;margin-bottom:4px">Placed · ${fmtK(actualTotal)} ${cur}${warn}</div>` +
           `<div style="display:flex;flex-wrap:wrap">` +
-          st.spread_legs.map((g) => {
-            const lc = BET_COLOR[g.bet] || "#b0b8d8";
-            return `<span class="bv-chip"><span style="color:${lc}">${g.label}</span>` +
-              `<span style="color:#3a3a60">${g.units}u</span></span>`;
+          Object.entries(actualBets).map(([bet, amt]) => {
+            const lc = BET_COLOR[bet] || "rgba(235,235,245,0.4)";
+            const label = BET_NAMES[bet] || bet;
+            return `<span class="bv-chip"><span style="color:${lc}">${label}</span>` +
+              `<span style="color:rgba(235,235,245,0.25)"> ${fmtK(amt)}</span></span>`;
           }).join("") + `</div></div>`;
-      }
-
-      if (!html) html = `<div style="color:#4a5070;font-size:10px">No spread data yet</div>`;
-      spreadEl.innerHTML = html;
-    }
-
-    // ── Pattern ──────────────────────────────────────────────────────────── //
-    const patEl = $("pattern");
-    if (patEl && pat) {
-      if (!_sectionInited.pattern) { sweepSection("pattern"); _sectionInited.pattern = true; }
-
-      const since = pat.hands_since || {};
-      const dragonBadge = pat.is_dragon
-        ? ` <span class="bv-dragon-badge" style="font-size:9px;font-weight:800;color:#ff3d71;letter-spacing:.5px">DRAGON</span>`
-        : "";
-      const streakTxt = pat.streak_len > 1
-        ? `${pat.streak_len}× ${pat.streak_side}${dragonBadge}`
-        : "none";
-      const chopPct = (pat.chop_score * 100).toFixed(0);
-      const chopCol = pat.chop_score > 0.6 ? "#00ff94" : pat.chop_score > 0.35 ? "#ffd700" : "#ff6b6b";
-      const persColor = { Dragon: "#ff3d71", Choppy: "#00ff94", Mixed: "#ffd700", Forming: "#c97bff" }[pat.personality] || "#4a5070";
-      const shoes = (data.library && data.library.shoes) ? data.library.shoes : 0;
-
-      // Animated bead row — last 14 hands, newest bead pops in, streak beads wave
-      const beadCols = { P:"#00b4ff", B:"#ff3d71", T:"#00ff94" };
-      const beadHtml = _handHistory.length
-        ? `<div style="display:flex;flex-wrap:wrap;align-items:center;margin-top:8px;gap:0">` +
-          _handHistory.map((w, i) => {
-            const isNew = hand && i === _handHistory.length - 1;
-            const inStreak = pat.streak_len > 1 && i >= _handHistory.length - pat.streak_len && !isNew;
-            const cls = `bv-bead${isNew ? " bv-bead-new" : inStreak ? " bv-bead-wave" : ""}`;
-            const wdly = inStreak ? `animation-delay:${(i % pat.streak_len) * 0.11}s;` : "";
-            const col  = beadCols[w] || "#5a6080";
-            return `<span class="${cls}" style="background:${col};box-shadow:0 0 5px ${col}55;${wdly}" title="${w}"></span>`;
-          }).join("") + `</div>`
-        : "";
-
-      patEl.innerHTML =
-        `<div class="bv-row">` +
-        `<span class="bv-lbl">Personality</span>` +
-        `<span class="bv-val" style="color:${persColor}">${pat.personality}</span></div>` +
-        `<div class="bv-row">` +
-        `<span class="bv-lbl">Streak</span>` +
-        `<span class="bv-val">${streakTxt}</span></div>` +
-        `<div class="bv-row">` +
-        `<span class="bv-lbl">Chop score</span>` +
-        `<span class="bv-val" style="color:${chopCol}">${chopPct}%</span></div>` +
-        bar(pat.chop_score, chopCol, 3) +
-        beadHtml +
-        `<div class="bv-row" style="margin-top:4px">` +
-        `<span class="bv-lbl">Last Tie / P / B</span>` +
-        `<span class="bv-val">${since.T ?? "?"}h · ${since.P ?? "?"}h · ${since.B ?? "?"}h ago</span></div>` +
-        (shoes ? `<div class="bv-row"><span class="bv-lbl">Shoe library</span>` +
-        `<span class="bv-val" style="color:#4a5070">${shoes} logged</span></div>` : "") +
-        renderTemplateMatch(data.template_match);
-
-      // Dragon onset shake
-      if (pat.is_dragon && !_prevDragon) {
-        const badge = patEl.querySelector(".bv-dragon-badge");
-        if (badge) {
-          badge.classList.remove("bv-shake");
-          void badge.offsetWidth;
-          badge.classList.add("bv-shake");
-          setTimeout(() => badge && badge.classList.remove("bv-shake"), 520);
+      } else if (st && st.spread_legs && st.spread_legs.length) {
+        // Fallback: session-aware suggestion (DOM bet reading not yet available)
+        const normVibe = m && m.vibe ? (m.vibe > 1 ? m.vibe / 100 : m.vibe) : 0.5;
+        const sugg = calcSuggestedSpread(bk, st, session, _shoeHistory, normVibe);
+        if (sugg) {
+          const pctLabel = (sugg.pct * 100).toFixed(0) + "%";
+          html += `<div style="margin-top:6px;padding-top:5px">` +
+            `<div style="font-size:10px;color:rgba(235,235,245,0.3);text-transform:uppercase;` +
+            `letter-spacing:.5px;margin-bottom:4px">Suggested · ${fmtK(sugg.total)} ${cur}` +
+            `<span style="font-size:9px;color:rgba(235,235,245,0.18);margin-left:5px">${pctLabel} of balance</span></div>` +
+            `<div style="display:flex;flex-wrap:wrap">` +
+            sugg.legs.map((g) => {
+              const lc = BET_COLOR[g.bet] || "rgba(235,235,245,0.4)";
+              const amt = g.stake ? fmtK(g.stake) : "—";
+              return `<span class="bv-chip"><span style="color:${lc}">${g.label}</span>` +
+                `<span style="color:rgba(235,235,245,0.25)"> ${amt}</span></span>`;
+            }).join("") + `</div></div>`;
         }
       }
-      _prevDragon = !!pat.is_dragon;
+
+      if (!html) html = `<div style="color:rgba(235,235,245,0.25);font-size:10px">No spread data yet</div>`;
+      spreadEl.innerHTML = html;
+      // Update allocation section header total
+      const allocTotal = panel && panel.querySelector("#bvsecv-alloc");
+      if (allocTotal) allocTotal.textContent = (ds && ds.total_stake) ? `${fmtK(ds.total_stake)} ${cur}` : "";
     }
 
-    // ── AI Engine ────────────────────────────────────────────────────────── //
+    // ── Session + Balance strip ───────────────────────────────────────────── //
+    const sessEl = $("session");
+    if (sessEl) {
+      if (!_sectionInited.session && session.followedHands > 0) { sweepSection("session"); _sectionInited.session = true; }
+      const followed = session.followedHands;
+      const pl = session.followedPL;
+      const plCol = pl >= 0 ? "#30d158" : "#ff453a";
+
+      // Balance + delta
+      let balNum = "—", balMeta = "";
+      if (bk && bk.balance) {
+        // Floating delta on balance change
+        if (_prevBalanceAnim !== null && bk.balance !== _prevBalanceAnim) {
+          const diff = bk.balance - _prevBalanceAnim;
+          const sign = diff >= 0 ? "+" : "-";
+          floatDelta(`${sign}${fmtK(Math.abs(diff))}`, diff >= 0 ? "#30d158" : "#ff453a", sessEl);
+        }
+        _prevBalanceAnim = bk.balance;
+        balNum = `${fmtK(bk.balance)}${cur ? " " + cur : ""}`;
+        if (bk.shoe_start != null) {
+          const delta = bk.balance - bk.shoe_start;
+          const dc = delta > 0 ? "rgba(48,209,88,0.7)" : delta < 0 ? "rgba(255,69,58,0.55)" : "rgba(235,235,245,0.2)";
+          balMeta = delta !== 0
+            ? `<span style="color:${dc};font-size:11px">${delta >= 0 ? "▲" : "▼"} ${fmtK(Math.abs(delta))} shoe</span>`
+            : "";
+        }
+      }
+
+      // Totals across all shoes this session (including archived shoes)
+      const allWins   = _shoeHistory.reduce((s, sh) => s + sh.wins, 0)   + session.wins;
+      const allLosses = _shoeHistory.reduce((s, sh) => s + sh.losses, 0) + session.losses;
+      const allPL     = _shoeHistory.reduce((s, sh) => s + sh.pl, 0)     + session.followedPL;
+      const allHands  = _shoeHistory.reduce((s, sh) => s + sh.hands, 0)  + session.followedHands;
+      const allPLCol  = allPL >= 0 ? "#30d158" : "#ff453a";
+
+      const plDisplay = allHands > 0 && allPL !== 0
+        ? `<span style="color:${allPLCol}">${allPL > 0 ? "+" : ""}${fmtK(allPL)}${cur ? " " + cur : ""}</span>`
+        : `<span style="color:rgba(235,235,245,0.2)">—</span>`;
+
+      const wHtml = `<span style="color:#30d158;font-weight:700">${allWins}W</span>`;
+      const lHtml = `<span style="color:#ff453a;font-weight:700">${allLosses}L</span>`;
+
+      // Shoe log: archived shoes + current shoe row
+      const hasShoeData = _shoeHistory.length > 0 || session.wins > 0 || session.losses > 0 || session.followedHands > 0;
+      let shoeLogHtml = "";
+      if (hasShoeData) {
+        const shoeRows = _shoeHistory.slice(-4).map((sh) => {
+          const plC = sh.pl !== 0 ? (sh.pl > 0 ? "#30d158" : "#ff453a") : "rgba(235,235,245,0.25)";
+          const plS = sh.pl !== 0 ? `${sh.pl > 0 ? "+" : ""}${fmtK(sh.pl)}${cur ? " " + cur : ""}` : "—";
+          return `<div style="display:flex;justify-content:space-between;font-size:10px;padding:1px 0">` +
+            `<span style="color:rgba(235,235,245,0.25)">Shoe ${sh.shoe + 1}</span>` +
+            `<span style="font-family:'JetBrains Mono',monospace;color:rgba(235,235,245,0.35)">${sh.wins}W&nbsp;${sh.losses}L</span>` +
+            `<span style="font-family:'JetBrains Mono',monospace;color:${plC}">${plS}</span>` +
+            `</div>`;
+        });
+        // Current shoe row (highlighted)
+        const curPlC = session.followedPL !== 0 ? (session.followedPL > 0 ? "#30d158" : "#ff453a") : "rgba(235,235,245,0.25)";
+        const curPlS = session.followedPL !== 0 ? `${session.followedPL > 0 ? "+" : ""}${fmtK(session.followedPL)}${cur ? " " + cur : ""}` : "—";
+        shoeRows.push(
+          `<div style="display:flex;justify-content:space-between;font-size:10px;padding:1px 0">` +
+          `<span style="color:rgba(235,235,245,0.55);font-weight:600">Shoe ${_shoeNum + 1}</span>` +
+          `<span style="font-family:'JetBrains Mono',monospace;color:rgba(235,235,245,0.55)">${session.wins}W&nbsp;${session.losses}L</span>` +
+          `<span style="font-family:'JetBrains Mono',monospace;color:${curPlC}">${curPlS}</span>` +
+          `</div>`
+        );
+        shoeLogHtml = `<div style="padding:6px 16px 10px">` +
+          `<div style="font-size:9px;font-weight:600;letter-spacing:0.08em;color:rgba(235,235,245,0.2);text-transform:uppercase;margin-bottom:5px">Shoes</div>` +
+          shoeRows.join("") + `</div>`;
+      }
+
+      sessEl.innerHTML =
+        `<div class="bv-session-grid">` +
+          `<div class="bv-session-cell">` +
+            `<div class="bv-micro-lbl">Balance</div>` +
+            `<div id="bv-balance-num">${balNum}</div>` +
+            `<div id="bv-balance-meta">${balMeta || "&nbsp;"}</div>` +
+          `</div>` +
+          `<div class="bv-session-cell">` +
+            `<div class="bv-micro-lbl">Session P/L</div>` +
+            `<div id="bv-session-pl">${plDisplay}</div>` +
+            `<div id="bv-session-meta">${wHtml} <span style="color:rgba(235,235,245,0.25)">·</span> ${lHtml} <span style="color:rgba(235,235,245,0.25)">·</span> ${allHands} sig</div>` +
+          `</div>` +
+        `</div>` +
+        shoeLogHtml;
+
+      // Section header: show balance for quick glance when collapsed
+      const sessSecVal = panel && panel.querySelector("#bvsecv-session");
+      if (sessSecVal) {
+        sessSecVal.textContent = bk && bk.balance ? fmtK(bk.balance) + (cur ? " " + cur : "") : "";
+      }
+    }
+
+    // ── Pattern / Shoe + Last Hand cards ─────────────────────────────────── //
+    const patEl = $("pattern");
+    if (patEl) {
+      if (!_sectionInited.pattern && (pat || (hand && hand.detail))) {
+        sweepSection("pattern"); _sectionInited.pattern = true;
+      }
+
+      // ── Last hand card display (always visible) ──────────────────────────
+      let lastCardHtml = "";
+      if (hand && hand.detail) {
+        const pc = hand.detail.player.map(c => cardHtml(c)).join("");
+        const bc = hand.detail.banker.map(c => cardHtml(c)).join("");
+        const wname = { P: "Player", B: "Banker", T: "Tie" }[hand.winner] || hand.winner;
+        const wcol = BET_COLOR[hand.winner === "P" ? "player" : hand.winner === "B" ? "banker" : "tie"] || "rgba(235,235,245,0.4)";
+        const extras = [
+          hand.is_natural ? "Natural" : null,
+          hand.p_pair    ? "P Pair"  : null,
+          hand.b_pair    ? "B Pair"  : null,
+        ].filter(Boolean).join(" · ");
+        lastCardHtml =
+          `<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);` +
+          `border-top:2px solid ${wcol}50;border-radius:10px;padding:10px 12px;margin-bottom:10px">` +
+          `<div class="bv-row" style="margin-bottom:5px">` +
+          `<span class="bv-lbl" style="min-width:62px">Player <span style="font-family:'JetBrains Mono',monospace;color:rgba(235,235,245,0.7)">${hand.player_total}</span></span>` +
+          `<span style="display:flex;gap:3px;flex-wrap:wrap;justify-content:flex-end">${pc}</span></div>` +
+          `<div class="bv-row" style="margin-bottom:8px">` +
+          `<span class="bv-lbl" style="min-width:62px">Banker <span style="font-family:'JetBrains Mono',monospace;color:rgba(235,235,245,0.7)">${hand.banker_total}</span></span>` +
+          `<span style="display:flex;gap:3px;flex-wrap:wrap;justify-content:flex-end">${bc}</span></div>` +
+          `<div>` +
+          `<span style="font-size:12px;font-weight:700;color:${wcol}">${wname} wins</span>` +
+          (extras ? `<div style="font-size:10px;color:rgba(235,235,245,0.3);margin-top:3px">${extras}</div>` : "") +
+          `</div></div>`;
+      }
+
+      // ── Pattern / shoe data ──────────────────────────────────────────────
+      let patHtml = "";
+      if (pat) {
+        const since = pat.hands_since || {};
+        const persColor = { Dragon:"#ff453a", Choppy:"#30d158", Mixed:"#ffd60a", Forming:"#bf5af2" }[pat.personality] || "rgba(235,235,245,0.3)";
+        const chopPct = (pat.chop_score * 100).toFixed(0);
+        const chopCol = pat.chop_score === 0
+          ? "rgba(235,235,245,0.2)"
+          : pat.chop_score > 0.6 ? "#30d158"
+          : pat.chop_score > 0.35 ? "#ffd60a"
+          : "#ff453a";
+        const dragonBadge = pat.is_dragon
+          ? ` <span class="bv-dragon-badge" style="font-size:9px;font-weight:700;color:#ff453a;letter-spacing:.04em">DRAGON</span>`
+          : "";
+        const streakTxt = pat.streak_len > 1
+          ? `${pat.streak_len}× ${pat.streak_side}${dragonBadge}`
+          : "—";
+
+        const beadCols = { P:"#0a84ff", B:"#ff453a", T:"#30d158" };
+        const beadHtml = _handHistory.length
+          ? `<div style="display:flex;flex-wrap:wrap;align-items:center;margin-top:8px">` +
+            _handHistory.map((w, i) => {
+              const isNew = hand && i === _handHistory.length - 1;
+              const inStreak = pat.streak_len > 1 && i >= _handHistory.length - pat.streak_len && !isNew;
+              const cls = `bv-bead${isNew ? " bv-bead-new" : inStreak ? " bv-bead-wave" : ""}`;
+              const wdly = inStreak ? `animation-delay:${(i % pat.streak_len) * 0.11}s;` : "";
+              const bc2  = beadCols[w] || "rgba(235,235,245,0.3)";
+              return `<span class="${cls}" style="background:${bc2};${wdly}" title="${w}"></span>`;
+            }).join("") + `</div>`
+          : "";
+
+        const regimeBadgeBg = { Dragon:"rgba(255,69,58,0.12)", Choppy:"rgba(48,209,88,0.1)", Mixed:"rgba(255,214,10,0.1)", Forming:"rgba(191,90,242,0.1)" }[pat.personality] || "rgba(255,255,255,0.06)";
+        const regimeBadgeBorder = { Dragon:"rgba(255,69,58,0.3)", Choppy:"rgba(48,209,88,0.25)", Mixed:"rgba(255,214,10,0.25)", Forming:"rgba(191,90,242,0.25)" }[pat.personality] || "rgba(255,255,255,0.08)";
+
+        patHtml =
+          `<div class="bv-regime-badge" style="background:${regimeBadgeBg};color:${persColor};border:1px solid ${regimeBadgeBorder}">` +
+          `${pat.personality}</div>` +
+          beadHtml +
+          `<div class="bv-row" style="margin-top:6px">` +
+          `<span class="bv-lbl">Streak</span>` +
+          `<span class="bv-val">${streakTxt}</span></div>` +
+          `<div class="bv-row">` +
+          `<span class="bv-lbl">Chop score</span>` +
+          `<span class="bv-val" style="color:${chopCol}">${chopPct}%</span></div>` +
+          bar(pat.chop_score, chopCol, 3) +
+          `<div class="bv-row" style="margin-top:4px">` +
+          `<span class="bv-lbl">Last T / P / B</span>` +
+          `<span class="bv-val">${since.T ?? "?"}h · ${since.P ?? "?"}h · ${since.B ?? "?"}h ago</span></div>`;
+
+        if (pat.is_dragon && !_prevDragon) {
+          setTimeout(() => {
+            const badge = patEl.querySelector(".bv-dragon-badge");
+            if (badge) {
+              badge.classList.remove("bv-shake"); void badge.offsetWidth;
+              badge.classList.add("bv-shake");
+              setTimeout(() => badge && badge.classList.remove("bv-shake"), 500);
+            }
+          }, 0);
+        }
+        _prevDragon = !!pat.is_dragon;
+      }
+
+      patEl.innerHTML = lastCardHtml + patHtml;
+
+      // Section header: show regime + streak when collapsed
+      const patSecVal = panel && panel.querySelector("#bvsecv-pattern");
+      if (patSecVal && pat) {
+        const persColor2 = { Dragon:"#ff453a", Choppy:"#30d158", Mixed:"#ffd60a", Forming:"#bf5af2" }[pat.personality] || "rgba(235,235,245,0.3)";
+        const streakSuffix = pat.streak_len > 1 ? ` · ${pat.streak_len}× ${pat.streak_side}` : "";
+        patSecVal.textContent = (pat.personality || "") + streakSuffix;
+        patSecVal.style.color = persColor2;
+      }
+    }
+
+    // ── AI Model (collapsible) ───────────────────────────────────────────── //
     const modelEl = $("model");
+    const modelVerdict = panel && panel.querySelector("#bvsecv-model");
     if (modelEl) {
       if (!_sectionInited.model && L && L.graded > 0) { sweepSection("model"); _sectionInited.model = true; }
       if (L && L.graded > 0) {
         const edge = (L.accuracy - L.baseline_accuracy) * 100;
-        const edgeCol = edge >= 0 ? "#00ff94" : "#ff3d71";
+        const edgeCol = edge >= 0 ? "#30d158" : "#ff453a";
         const accPct = L.accuracy || 0;
         const pl = L.profit || 0;
-        const plCol = pl >= 0 ? "#00ff94" : "#ff3d71";
-        const vcol = L.significant ? "#00ff94" : L.actionable ? "#ffd700" : "#4a5070";
+        const plCol = pl >= 0 ? "#30d158" : "#ff453a";
+        const vcol = L.significant ? "#30d158" : L.actionable ? "#ffd60a" : "rgba(235,235,245,0.3)";
+        const shoes = (data.library && data.library.shoes) || 0;
+
+        if (modelVerdict) modelVerdict.textContent = L.verdict || "";
 
         modelEl.innerHTML =
           `<div class="bv-row">` +
           `<span class="bv-lbl">Accuracy</span>` +
           `<span class="bv-val">${(accPct * 100).toFixed(1)}%` +
           ` <span style="color:${edgeCol};font-size:10px">(${edge >= 0 ? "+" : ""}${edge.toFixed(1)} vs base)</span></span></div>` +
-          bar(accPct, edgeCol >= 0 ? "#00ff94" : "#ff3d71", 3) +
+          bar(accPct, edgeCol, 3) +
           `<div class="bv-row">` +
           `<span class="bv-lbl">P/H · recent</span>` +
           `<span class="bv-val">${pnl(L.profit_per_hand * 100, 1)}/100 · ${(L.recent_accuracy * 100).toFixed(0)}%</span></div>` +
           `<div class="bv-row">` +
           `<span class="bv-lbl">Model P/L</span>` +
-          `<span class="bv-val" style="color:${plCol}">${pl >= 0 ? "+" : ""}${pl.toFixed(1)}u (from 100u)</span></div>` +
+          `<span class="bv-val" style="color:${plCol}">${pl >= 0 ? "+" : ""}${pl.toFixed(1)}u</span></div>` +
           `<div class="bv-row">` +
           `<span class="bv-lbl">Top expert</span>` +
-          `<span class="bv-val" style="color:#c97bff;overflow:hidden;text-overflow:ellipsis;max-width:130px">${L.best_expert}</span></div>` +
+          `<span class="bv-val" style="color:#bf5af2;overflow:hidden;text-overflow:ellipsis;max-width:130px">${L.best_expert}</span></div>` +
           `<div style="margin-top:3px;font-size:10px;color:${vcol};overflow:hidden;` +
           `text-overflow:ellipsis;white-space:nowrap">${L.verdict}</div>` +
           renderVoteSummary(data.vote_summary) +
-          renderCalibration(data.calibration);
+          renderCalibration(data.calibration) +
+          renderTemplateMatch(data.template_match) +
+          // Bet stats table
+          (L.bets ? (() => {
+            const richHands = (data.vision && data.vision.length) ? data.vision[0].n : 0;
+            return `<hr class="bv-divider">` +
+              `<div style="color:rgba(235,235,245,0.25);font-size:10px;margin-bottom:4px">${richHands} card-hands · ${shoes} shoes</div>` +
+              `<table class="bv-bet-tbl"><thead><tr>` +
+              `<td style="color:rgba(235,235,245,0.3)">Bet</td><td style="color:rgba(235,235,245,0.3)">Hit%</td>` +
+              `<td style="color:rgba(235,235,245,0.3)">Hands</td><td style="color:rgba(235,235,245,0.3)">/100</td></tr></thead><tbody>` +
+              L.bets.map((r) => {
+                const star = r.significant ? `<span style="display:inline-flex;vertical-align:middle;margin-left:3px">${icon("check",9,"#30d158")}</span>` : "";
+                const pc = (r.hit * 100).toFixed(0);
+                return `<tr><td style="color:${BET_COLOR[r.bet] || "rgba(235,235,245,0.4)"}">${BET_NAMES[r.bet] || r.bet}${star}</td>` +
+                  `<td>${pc}%</td><td>${r.n}</td><td>${pnl(r.per100)}</td></tr>`;
+              }).join("") + `</tbody></table>`;
+          })() : "");
       } else {
-        modelEl.innerHTML = `<div style="display:flex;align-items:center;gap:6px;color:#4a5070;font-size:11px">${icon("refresh-cw",13,"#4a5070")} Collecting data — grading every hand…</div>`;
+        if (modelVerdict) modelVerdict.textContent = "collecting data…";
+        modelEl.innerHTML = `<div style="display:flex;align-items:center;gap:6px;color:rgba(235,235,245,0.3);font-size:11px">${icon("refresh-cw",13,"rgba(235,235,245,0.25)")} Grading every hand — check back soon</div>`;
       }
-    }
-
-    // ── Balance ──────────────────────────────────────────────────────────── //
-    const balEl = $("balance");
-    if (balEl) {
-      if (!_sectionInited.balance && bk && bk.balance) { sweepSection("balance"); _sectionInited.balance = true; }
-      if (bk && bk.currency && bk.balance) {
-        // Floating delta on balance change
-        if (_prevBalanceAnim !== null && bk.balance !== _prevBalanceAnim) {
-          const diff = bk.balance - _prevBalanceAnim;
-          const sign = diff >= 0 ? "+" : "-";
-          floatDelta(`${sign}${fmtK(Math.abs(diff))}`, diff >= 0 ? "#00ff94" : "#ff3d71", balEl);
-        }
-        _prevBalanceAnim = bk.balance;
-
-        const delta = (bk.balance != null && bk.shoe_start != null) ? bk.balance - bk.shoe_start : null;
-        const deltaCol = delta == null ? "" : delta >= 0 ? "#00ff94" : "#ff3d71";
-        balEl.innerHTML =
-          `<div style="font-size:20px;font-weight:800;color:#00e5ff;letter-spacing:.3px;` +
-          `margin-bottom:2px">${fmtK(bk.balance)} <span style="font-size:12px;` +
-          `font-weight:600;color:#3a5070">${bk.currency}</span></div>` +
-          (delta != null
-            ? `<div style="font-size:12px;font-weight:700;color:${deltaCol}">` +
-              `${delta >= 0 ? "▲" : "▼"} ${fmtK(Math.abs(delta))} this shoe</div>`
-            : "") +
-          (bk.suggested_pnl != null && bk.suggested_pnl !== 0
-            ? `<div class="bv-row" style="margin-top:4px"><span class="bv-lbl">Suggested P/L</span>` +
-              `<span class="bv-val">${pnlFmt(bk.suggested_pnl)} ${bk.currency}</span></div>`
-            : "");
-      } else {
-        balEl.innerHTML = `<div style="display:flex;align-items:center;gap:5px;color:#ff9f00;font-size:11px">${icon("alert-triangle",13,"#ff9f00")} Balance not detected — open the table first</div>`;
-      }
-    }
-
-    // ── Session ──────────────────────────────────────────────────────────── //
-    const sessEl = $("session");
-    if (sessEl) {
-      const followed = session.followedHands;
-      const pl = session.followedPL;
-      const plCol = pl >= 0 ? "#00ff94" : "#ff3d71";
-      sessEl.innerHTML =
-        (followed > 0
-          ? `<div style="font-size:17px;font-weight:800;color:${plCol};margin-bottom:3px">` +
-            `${pl >= 0 ? "▲" : "▼"} ${fmtK(Math.abs(pl))}${cur ? " " + cur : ""}</div>` +
-            `<div class="bv-reason" style="margin-bottom:5px">on ${followed} BET-signalled hand${followed !== 1 ? "s" : ""}</div>`
-          : `<div class="bv-reason" style="margin-bottom:5px">No BET signals recorded yet</div>`) +
-        `<div class="bv-row"><span class="bv-lbl">Total new hands</span>` +
-        `<span class="bv-val">${session.totalHands}</span></div>` +
-        `<div class="bv-row"><span class="bv-lbl">BET signals followed</span>` +
-        `<span class="bv-val">${followed}</span></div>`;
-    }
-
-    // ── 🃏 Last Hand ─────────────────────────────────────────────────────── //
-    const handEl = $("hand");
-    if (handEl && hand && hand.detail) {
-      const p = hand.detail.player.map(cardHtml).join("");
-      const b = hand.detail.banker.map(cardHtml).join("");
-      const wname = { P: "Player", B: "Banker", T: "Tie" }[hand.winner] || hand.winner;
-      const wcol = BET_COLOR[hand.winner === "P" ? "player" : hand.winner === "B" ? "banker" : "tie"] || "#b0b8d8";
-      handEl.innerHTML =
-        `<div class="bv-row" style="margin-bottom:4px">` +
-        `<span class="bv-lbl">Player ${hand.player_total}</span><span>${p}</span></div>` +
-        `<div class="bv-row" style="margin-bottom:6px">` +
-        `<span class="bv-lbl">Banker ${hand.banker_total}</span><span>${b}</span></div>` +
-        `<div style="font-size:13px;font-weight:700;color:${wcol};text-shadow:0 0 8px ${wcol}">` +
-        `▶ ${wname} wins${hand.is_natural ? " · Natural" : ""}` +
-        `${hand.p_pair ? " · P Pair" : ""}${hand.b_pair ? " · B Pair" : ""}</div>`;
-    } else if (handEl) {
-      handEl.innerHTML = `<div style="color:#4a5070;font-size:10px">Waiting for next hand…</div>`;
-    }
-
-    // ── All Bets ─────────────────────────────────────────────────────────── //
-    const betsEl = $("bets");
-    if (betsEl && L && L.bets) {
-      const richHands = (data.vision && data.vision.length) ? data.vision[0].n : 0;
-      const shoes = (data.library && data.library.shoes) || 0;
-      betsEl.innerHTML =
-        `<div style="color:#4a5070;font-size:10px;margin-bottom:4px">` +
-        `${richHands} card-hands · ${shoes} shoes logged</div>` +
-        `<table class="bv-bet-tbl"><thead><tr>` +
-        `<td style="color:#4a5070">Bet</td><td style="color:#4a5070">Hit%</td>` +
-        `<td style="color:#4a5070">Hands</td><td style="color:#4a5070">/100</td></tr></thead><tbody>` +
-        L.bets.map((r) => {
-          const star = r.significant ? `<span style="display:inline-flex;vertical-align:middle;margin-left:3px">${icon("check",9,"#00ff94")}</span>` : "";
-          const pc = (r.hit * 100).toFixed(0);
-          const pcol = r.significant ? "#00ff94" : r.per100 > 0 ? "#ffd700" : "#b0b8d8";
-          return `<tr><td style="color:${BET_COLOR[r.bet] || "#b0b8d8"}">${BET_NAMES[r.bet] || r.bet}${star}</td>` +
-            `<td>${pc}%</td><td>${r.n}</td>` +
-            `<td>${pnl(r.per100)}</td></tr>`;
-        }).join("") + `</tbody></table>`;
     }
   }
 
   // ----- boot ---------------------------------------------------------------
   log("Baccarat Vision content script loaded in", location.href);
-  relayBalance();
-  setInterval(relayBalance, 1500);
-  let pending = null;
-  const observer = new MutationObserver(() => {
-    // Read counter synchronously here so the 250 ms debounce below can't race
-    // against a subsequent "Burn Card Procedure" DOM update that hides the counter.
-    const _oc = readCounter();
-    if (_oc) _savedCounter = _oc;
-    if (pending) return;
-    pending = setTimeout(() => { pending = null; tick(); }, 250);
+  _loadSession(); // restore session stats from prior page load / refresh
+  // Load persisted section open/close state before first render so sections
+  // start in the user's last-chosen state rather than always defaulting open.
+  _loadSectionState(() => {
+    relayBalance();
+    setInterval(relayBalance, 1500);
+    let pending = null;
+    const observer = new MutationObserver(() => {
+      // Read counter synchronously here so the 250 ms debounce below can't race
+      // against a subsequent "Burn Card Procedure" DOM update that hides the counter.
+      const _oc = readCounter();
+      if (_oc) _savedCounter = _oc;
+      if (pending) return;
+      pending = setTimeout(() => { pending = null; tick(); }, 250);
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    setInterval(tick, 1500);
+    window.__bv = { readCounter, readHand, parseCard, tick, SEL };
   });
-  observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-  setInterval(tick, 1500);
-  window.__bv = { readCounter, readHand, parseCard, tick, SEL };
 })();
